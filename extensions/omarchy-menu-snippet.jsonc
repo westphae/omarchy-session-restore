@@ -1,0 +1,10 @@
+// Merge these rows into ~/.config/omarchy/extensions/omarchy-menu.jsonc and run
+// `omarchy menu refresh`. They take a final snapshot of your windows right
+// before Omarchy closes them for logout / reboot / shutdown, then hand over to
+// the stock `omarchy-system` command. (Replace the path if your home differs.)
+{
+  "system.session-save": {"icon":"󰆓","label":"Save Session","action":"$HOME/.local/bin/omarchy-session save"},
+  "system.logout": {"icon":"󰍃","label":"Logout","action":"$HOME/.local/bin/omarchy-session save --final --quiet; omarchy-system logout"},
+  "system.reboot": {"icon":"󰜉","label":"Reboot","action":"$HOME/.local/bin/omarchy-session save --final --quiet; omarchy-system reboot"},
+  "system.shutdown": {"icon":"󰐥","label":"Shutdown","action":"$HOME/.local/bin/omarchy-session save --final --quiet; omarchy-system shutdown"}
+}

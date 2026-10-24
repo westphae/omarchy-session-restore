@@ -1,0 +1,2029 @@
+#!/usr/bin/env python3
+# omarchy-session — save and restore your Hyprland windows across reboots.
+#
+# Part of the eric.session-restore Omarchy plugin. Inspired by and derived
+# from wbarakat/omarchy-session-restore (MIT, Copyright (c) 2026 Waleed); see LICENSE.
+#
+# Usage:
+#   omarchy-session save [--final] [--quiet]
+#   omarchy-session restore [--dry-run] [--force] [--file F | --prev] [--workspace N ...]
+#   omarchy-session status | enable | disable | daemon
+#   omarchy-session install-hook | uninstall-hook
+#
+# Design notes
+#   * Launch plans are computed at SAVE time (while /proc still describes
+#     the running processes) and stored as argv lists. Restore never passes
+#     a saved string through `sh -c`; argv lists are shlex-quoted before being
+#     handed to Hyprland's exec dispatcher.
+#   * A saved session is restored at most once: it is moved into restored/
+#     before anything is launched, and its hash is recorded in
+#     last-restore.json. Sessions saved by the *current* Hyprland instance are
+#     never restored (so restarting omarchy-shell is harmless).
+
+import argparse
+import ctypes
+import difflib
+import fcntl
+import glob
+import hashlib
+import json
+import os
+import re
+import select
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+VERSION = "1.1.0"
+FORMAT = 1
+HOME = os.path.expanduser("~")
+XDG_STATE = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state")
+XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+XDG_DATA = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share")
+STATE_DIR = os.path.join(XDG_STATE, "omarchy", "session-restore")
+SESSION = os.path.join(STATE_DIR, "session.json")
+PREV = os.path.join(STATE_DIR, "session.prev.json")
+RESTORED_DIR = os.path.join(STATE_DIR, "restored")
+LAST_RESTORE = os.path.join(STATE_DIR, "last-restore.json")
+FREEZE = os.path.join(STATE_DIR, "freeze")
+LOG = os.path.join(STATE_DIR, "session-restore.log")
+DAEMON_LOCK = os.path.join(STATE_DIR, "daemon.lock")
+SAVE_LOCK = os.path.join(STATE_DIR, "save.lock")
+RESTORE_LOCK = os.path.join(STATE_DIR, "restore.lock")
+CONFIG = os.path.join(XDG_CONFIG, "omarchy", "session-restore.json")
+RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "omarchy-session-restore")
+SELF = os.path.realpath(__file__)
+HOOK_FILE = os.path.join(os.path.dirname(os.path.dirname(SELF)), "shell", "session-hook.sh")
+HOOK_MARK = "# omarchy-session-restore hook"
+ATUIN_RE = re.compile(r"[0-9a-fA-F-]{32,36}")
+ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+
+DEFAULTS = {
+    "enabled": True,
+    "max_age_hours": 168,          # don't restore sessions older than this
+    "max_login_age_seconds": 900,  # only auto-restore this soon after Hyprland starts
+    "save_interval_seconds": 60,
+    "event_debounce_seconds": 3,
+    "browser_wait_seconds": 60,
+    "terminal_wait_seconds": 10,
+    "app_wait_seconds": 20,
+    "skip_classes": [],            # window classes never saved (regexes, full match)
+    "resume_commands": ["herdr", "tmux", "zellij", "screen", "nvim", "vim", "vi",
+                        "hx", "helix", "btop", "htop", "top", "lazygit",
+                        "lazydocker", "yazi", "ranger", "nnn", "lf", "mc"],
+    "notify": True,
+    "resume_agents": True,         # restart coding agents (claude, codex, grok, ...) on restore
+}
+
+# --------------------------------------------------------------------------
+# Known terminals. key = binary basename; classes = Wayland app ids.
+#   dir: how to pass a working directory
+#        ("eq", "--flag")  -> --flag=DIR      ("sep", "--flag") -> --flag DIR
+#        ("env",)          -> wrap with `env -C DIR`
+#        ("wezterm",)      -> wezterm start --cwd DIR [-- cmd]
+#   exec: flag that introduces a command (None = command is positional)
+#   launcher: binary to launch if different from the process (gnome-terminal)
+#   keep: bare flags (no '=') from the running process worth keeping
+TERMINALS = {
+    # A single-instance ghostty hands new windows to the running instance over
+    # D-Bus and drops --working-directory, so restored windows run standalone.
+    "ghostty": dict(classes=["com.mitchellh.ghostty", "ghostty"], dir=("eq", "--working-directory"), exec="-e",
+                    drop=["--gtk-single-instance"], add=["--gtk-single-instance=false"]),
+    "kitty": dict(classes=["kitty"], dir=("sep", "--directory"), exec=None, drop=["-1", "--single-instance", "--instance-group"]),
+    "alacritty": dict(classes=["alacritty", "Alacritty"], dir=("sep", "--working-directory"), exec="-e"),
+    "foot": dict(classes=["foot"], dir=("eq", "--working-directory"), exec=None),
+    "footclient": dict(classes=["footclient"], dir=("eq", "--working-directory"), exec=None),
+    "wezterm-gui": dict(classes=["org.wezfurlong.wezterm"], dir=("wezterm",), exec=None, launcher="wezterm"),
+    "wezterm": dict(classes=["org.wezfurlong.wezterm"], dir=("wezterm",), exec=None),
+    "konsole": dict(classes=["org.kde.konsole", "konsole"], dir=("sep", "--workdir"), exec="-e"),
+    "gnome-terminal-server": dict(classes=["org.gnome.Terminal", "gnome-terminal-server"], dir=("eq", "--working-directory"), exec="--", launcher="gnome-terminal"),
+    "gnome-terminal": dict(classes=["org.gnome.Terminal"], dir=("eq", "--working-directory"), exec="--"),
+    "kgx": dict(classes=["org.gnome.Console", "kgx"], dir=("eq", "--working-directory"), exec="-e"),
+    "ptyxis": dict(classes=["org.gnome.Ptyxis"], dir=("eq", "--working-directory"), exec="-x"),
+    "xfce4-terminal": dict(classes=["xfce4-terminal", "Xfce4-terminal"], dir=("eq", "--working-directory"), exec="-x"),
+    "tilix": dict(classes=["com.gexperts.Tilix", "tilix"], dir=("eq", "--working-directory"), exec="-e"),
+    "terminator": dict(classes=["terminator", "Terminator"], dir=("eq", "--working-directory"), exec="-x"),
+    "rio": dict(classes=["rio"], dir=("sep", "--working-dir"), exec="-e"),
+    "urxvt": dict(classes=["URxvt", "urxvt"], dir=("sep", "-cd"), exec="-e"),
+    "st": dict(classes=["st", "St", "st-256color"], dir=("env",), exec="-e"),
+    "xterm": dict(classes=["xterm", "XTerm"], dir=("env",), exec="-e"),
+    "contour": dict(classes=["contour", "org.contourterminal.Contour"], dir=("sep", "--working-directory"), exec=None),
+}
+
+BROWSER_BINS = {
+    # chromium family
+    "chrome", "google-chrome", "google-chrome-stable", "google-chrome-beta",
+    "google-chrome-unstable", "chromium", "chromium-browser", "brave",
+    "brave-browser", "brave-browser-stable", "msedge", "microsoft-edge",
+    "microsoft-edge-stable", "vivaldi", "vivaldi-bin", "vivaldi-stable", "opera",
+    "helium", "helium-browser", "thorium", "thorium-browser", "ungoogled-chromium",
+    "cromite", "supermium",
+    # firefox family
+    "firefox", "firefox-bin", "firefox-esr", "firefox-developer-edition",
+    "firefox-nightly", "librewolf", "zen", "zen-bin", "zen-browser", "floorp",
+    "waterfox", "mullvad-browser", "tor-browser", "palemoon", "basilisk",
+    # others
+    "epiphany", "qutebrowser", "falkon", "midori", "ladybird",
+}
+WEBAPP_CLASS = re.compile(
+    r"^(chrome|google-chrome|chromium|brave|brave-browser|msedge|microsoft-edge|vivaldi|"
+    r"helium|opera|thorium|cromite)-(?P<app>.+)-(?P<profile>Default|Profile_\d+|Guest_Profile)$")
+SHELLS = {"bash", "zsh", "fish", "sh", "dash", "ksh", "mksh", "tcsh", "csh", "nu",
+          "elvish", "xonsh", "oil", "osh", "ysh", "ion", "pwsh"}
+FIELD_CODES = {"%f", "%F", "%u", "%U", "%d", "%D", "%n", "%N", "%i", "%c", "%k", "%v", "%m"}
+STRUCTURAL_EVENTS = {"openwindow", "closewindow", "movewindow", "movewindowv2",
+                     "changefloatingmode", "fullscreen", "pin", "moveworkspace",
+                     "moveworkspacev2", "renameworkspace", "windowtitlev2"}
+TITLE_EVENTS = {"windowtitlev2"}
+
+QUIET = False
+
+
+# ------------------------------------------------------------------ utils --
+def open_lock(path):
+    return os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+")
+
+
+def ensure_dirs():
+    for d in (STATE_DIR, RESTORED_DIR):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+
+
+def log(msg, echo=False):
+    line = time.strftime("%Y-%m-%d %H:%M:%S ") + msg
+    if echo and not QUIET:
+        print(msg, file=sys.stderr)
+    try:
+        ensure_dirs()
+        if os.path.exists(LOG) and os.path.getsize(LOG) > 512 * 1024:
+            os.replace(LOG, LOG + ".1")
+        fd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG) as f:
+            user = json.load(f)
+        if isinstance(user, dict):
+            for k, v in user.items():
+                if k in DEFAULTS and (type(v) is type(DEFAULTS[k]) or
+                                      (isinstance(DEFAULTS[k], (int, float)) and
+                                       isinstance(v, (int, float)) and not isinstance(v, bool))):
+                    cfg[k] = v
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        log(f"config: ignoring unreadable {CONFIG}: {e}")
+    return cfg
+
+
+def write_config_key(key, value):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    data = {}
+    try:
+        with open(CONFIG) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        pass
+    data[key] = value
+    atomic_write(CONFIG, json.dumps(data, indent=2) + "\n", mode=0o644)
+
+
+def atomic_write(path, text, mode=0o600, keep_prev=None):
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix="." + os.path.basename(path) + ".")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        if keep_prev and os.path.exists(path):
+            ptmp = keep_prev + ".tmp"
+            try:
+                os.unlink(ptmp)
+            except FileNotFoundError:
+                pass
+            os.link(path, ptmp)
+            os.replace(ptmp, keep_prev)
+        os.replace(tmp, path)
+        dfd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def run(argv, timeout=5):
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, str(e)
+
+
+def notify(cfg, summary, body=""):
+    if cfg.get("notify") and shutil.which("notify-send"):
+        run(["notify-send", "-a", "Session Restore", "-i", "view-restore", summary, body])
+
+
+def fmt_age(sec):
+    sec = int(sec)
+    if sec < 90:
+        return f"{sec}s"
+    if sec < 5400:
+        return f"{sec // 60}m"
+    if sec < 172800:
+        return f"{sec / 3600:.1f}h"
+    return f"{sec / 86400:.1f}d"
+
+
+# --------------------------------------------------------------- hyprland --
+def hypr_json(what):
+    rc, out = run(["hyprctl", "-j", what])
+    if rc != 0:
+        raise RuntimeError(f"hyprctl {what} failed: {out.strip()[:200]}")
+    return json.loads(out)
+
+
+def lua_long(s):
+    """Return s as a Lua long-bracket string literal that cannot be broken out of."""
+    level = 0
+    while ("]" + "=" * level + "]") in s or s.endswith("]" + "=" * level):
+        level += 1
+    eq = "=" * level
+    # a leading newline would be swallowed by Lua; protect it
+    lead = "\n" if s.startswith("\n") else ""
+    return f"[{eq}[{lead}{s}]{eq}]"
+
+
+def dispatch(lua):
+    rc, out = run(["hyprctl", "dispatch", lua])
+    ok = rc == 0 and "ok" in out.lower() and "error" not in out.lower()
+    if not ok:
+        log(f"dispatch failed ({rc}): {lua[:300]} -> {out.strip()[:300]}")
+    return ok
+
+
+def ws_selector(w):
+    wid, name = w.get("workspace"), w.get("ws_name") or ""
+    if isinstance(wid, int) and wid > 0 and (not name or name == str(wid)):
+        return str(wid)
+    if name:
+        return "name:" + name
+    return str(wid)
+
+
+def exec_dispatch_string(argv, ws, use_uwsm=True):
+    cmd = shlex.join((["uwsm-app", "--"] if use_uwsm else []) + list(argv))
+    return f"hl.dsp.exec_cmd({lua_long(f'[workspace {ws} silent] {cmd}')})"
+
+
+def instance_sig():
+    return os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+
+
+def boot_id():
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+# ------------------------------------------------------------------ /proc --
+def cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            raw = f.read()
+    except OSError:
+        return []
+    return [a.decode(errors="surrogateescape") for a in raw.split(b"\0") if a != b""] if raw else []
+
+
+def exe_of(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return ""
+
+
+def cwd_of(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return ""
+
+
+def stat_of(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            s = f.read()
+        rest = s[s.rindex(")") + 2:].split()
+        return {"ppid": int(rest[1]), "start": int(rest[19])}
+    except (OSError, ValueError, IndexError):
+        return {"ppid": 0, "start": 0}
+
+
+def children(pid):
+    kids = set()
+    for p in glob.glob(f"/proc/{pid}/task/*/children"):
+        try:
+            with open(p) as f:
+                kids.update(int(x) for x in f.read().split())
+        except (OSError, ValueError):
+            pass
+    return sorted(kids, key=lambda k: stat_of(k)["start"])
+
+
+def environ_var(pid, key):
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            for kv in f.read().split(b"\0"):
+                if kv.startswith(key.encode() + b"="):
+                    return kv.split(b"=", 1)[1].decode(errors="replace")
+    except OSError:
+        pass
+    return ""
+
+
+def flatpak_id(pid):
+    try:
+        with open(f"/proc/{pid}/cgroup") as f:
+            m = re.search(r"app-flatpak-([A-Za-z0-9._-]+?)-\d+\.scope", f.read())
+            return m.group(1) if m else ""
+    except OSError:
+        return ""
+
+
+def main_process(pid):
+    """Chromium/Electron helpers carry --type=...; walk up to the browser process."""
+    seen = 0
+    while seen < 8:
+        argv = cmdline(pid)
+        if not any(a.startswith("--type=") for a in argv):
+            return pid
+        ppid = stat_of(pid)["ppid"]
+        if ppid <= 1:
+            return pid
+        pid, seen = ppid, seen + 1
+    return pid
+
+
+def base(path):
+    return os.path.basename(path or "")
+
+
+def proc_basename(argv, exe):
+    b = base(argv[0]) if argv else ""
+    return b or base(exe)
+
+
+# --------------------------------------------------------- desktop files --
+def parse_exec(s):
+    try:
+        parts = shlex.split(s)
+    except ValueError:
+        return []
+    out = []
+    for p in parts:
+        if p in FIELD_CODES:
+            continue
+        p = re.sub(r"%[fFuUdDnNickvm]", "", p).replace("%%", "%")
+        if p:
+            out.append(p)
+    # strip `env VAR=x` prefixes are fine to keep; they are argv too
+    return out
+
+
+class DesktopIndex:
+    def __init__(self):
+        self.entries = []
+        seen = set()
+        dirs = [XDG_DATA] + (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":")
+        dirs += [os.path.join(XDG_DATA, "flatpak/exports/share"), "/var/lib/flatpak/exports/share"]
+        for d in dirs:
+            appdir = os.path.join(d, "applications")
+            if not os.path.isdir(appdir):
+                continue
+            for path in sorted(glob.glob(os.path.join(appdir, "**", "*.desktop"), recursive=True)):
+                did = os.path.relpath(path, appdir).replace("/", "-")
+                if did in seen:
+                    continue
+                seen.add(did)
+                e = self._parse(path)
+                if not e or e.get("Hidden", "").lower() == "true" or e.get("Type", "Application") != "Application":
+                    continue
+                e["id"] = did
+                e["path"] = path
+                e["argv"] = parse_exec(e.get("Exec", ""))
+                e["cats"] = set(filter(None, e.get("Categories", "").split(";")))
+                if e["argv"]:
+                    self.entries.append(e)
+
+    @staticmethod
+    def _parse(path):
+        entry, section = {}, None
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith("["):
+                        section = line
+                        continue
+                    if section != "[Desktop Entry]" or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    if "[" in k:
+                        continue
+                    entry.setdefault(k, v.strip())
+        except OSError:
+            return None
+        return entry
+
+    def for_class(self, cls, exe_names=()):
+        if not cls:
+            return None
+        c = cls.lower()
+        stem = lambda e: e["id"][:-8].lower()
+        for test in (
+            lambda e: e.get("StartupWMClass", "").lower() == c,
+            lambda e: stem(e) == c,
+            lambda e: stem(e).split(".")[-1] == c,
+        ):
+            for e in self.entries:
+                if test(e):
+                    return e
+        names = {n.lower() for n in exe_names if n}
+        if names:
+            for e in self.entries:
+                if base(e["argv"][0]).lower() in names and not any(a.startswith("--app") or "://" in a for a in e["argv"][1:]):
+                    return e
+        return None
+
+    def webapp_for_class(self, cls):
+        for e in self.entries:
+            if e.get("StartupWMClass", "") == cls:
+                return e
+        for e in self.entries:
+            url = webapp_url_from_argv(e["argv"])
+            if url and cls_matches_url(cls, url):
+                return e
+        return None
+
+    def terminals(self):
+        return [e for e in self.entries if "TerminalEmulator" in e["cats"]]
+
+
+def webapp_url_from_argv(argv):
+    for i, a in enumerate(argv):
+        if a.startswith("--app="):
+            return a[6:]
+        if base(a) in ("omarchy-launch-webapp", "omarchy-webapp-handler") and i + 1 < len(argv):
+            return argv[i + 1]
+    return ""
+
+
+def url_to_app_key(url):
+    m = re.match(r"^[a-z]+://([^/?#]+)(/[^?#]*)?", url)
+    if not m:
+        return ""
+    host, path = m.group(1), m.group(2) or "/"
+    return host + "_" + path.replace("/", "_")
+
+
+def cls_matches_url(cls, url):
+    m = WEBAPP_CLASS.match(cls)
+    if not m:
+        return False
+    key = url_to_app_key(url)
+    return key and (m.group("app") == key or m.group("app") == key.rstrip("_") + "_")
+
+
+def default_terminal_ids():
+    ids = []
+    for d in [XDG_CONFIG] + (os.environ.get("XDG_CONFIG_DIRS") or "/etc/xdg").split(":"):
+        p = os.path.join(d, "xdg-terminals.list")
+        try:
+            with open(p) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith(("#", "-")):
+                        ids.append(line.split(":")[0])
+        except OSError:
+            pass
+    return ids
+
+
+# ------------------------------------------------------- classification --
+def terminal_spec(cls, pbase, desk_entry):
+    if pbase in TERMINALS:
+        return pbase, TERMINALS[pbase]
+    for k, spec in TERMINALS.items():
+        if cls in spec["classes"] or cls.lower() in [c.lower() for c in spec["classes"]]:
+            return k, spec
+    if desk_entry and "TerminalEmulator" in desk_entry["cats"]:
+        b = base(desk_entry["argv"][0])
+        if b in TERMINALS:
+            return b, TERMINALS[b]
+        return b or pbase, None
+    return None, None
+
+
+def is_shell(pid):
+    a = cmdline(pid)
+    b = base(a[0]).lstrip("-") if a else ""
+    return b in SHELLS or base(exe_of(pid)) in SHELLS
+
+
+def resume_argv(cfg, shell_pid):
+    """The foreground program in a shell, if it is one we know how to resume."""
+    kids = [k for k in children(shell_pid)]
+    if not kids:
+        return None
+    fg = kids[-1]
+    a = cmdline(fg)
+    if not a:
+        return None
+    name = base(a[0])
+    if name not in cfg["resume_commands"]:
+        return None
+    # prefer the PATH name over versioned install paths (mise, nix, ...)
+    if shutil.which(name):
+        a = [name] + a[1:]
+    if name == "tmux":
+        sub = a[1:]
+        if sub and sub[0] in ("a", "at", "attach", "attach-session"):
+            t = sub[sub.index("-t") + 1] if "-t" in sub and sub.index("-t") + 1 < len(sub) else None
+            a = ["tmux", "new-session", "-A"] + (["-s", t] if t else [])
+        elif sub[:1] in (["new"], ["new-session"]) and "-s" in sub:
+            i = sub.index("-s")
+            if i + 1 < len(sub):
+                a = ["tmux", "new-session", "-A", "-s", sub[i + 1]]
+    if name == "zellij" and len(a) > 1 and a[1] in ("attach", "a") and len(a) > 2:
+        a = ["zellij", "attach", "--create", a[-1]]
+    return a
+
+
+# ------------------------------------------------------------ agents --
+# Coding-agent CLIs and how to get back into the conversation that was open.
+#   bins   executable names (the first is what gets launched; the shell resolves
+#          it through PATH, so mise/npm/nix shims keep working)
+#   pkg    path fragments that identify the agent when it runs as
+#          `node .../cli.js`, `python -m ...` or from a versioned install dir
+#   ids    flags that carry a session id on the original command line
+#   sub    subcommand that takes the id positionally (`codex resume <id>`)
+#   resume argv tail that resumes {id}
+#   cont   argv tail that resumes the most recent session in the cwd, used when
+#          no id can be found (None: the agent is restarted fresh — no prompt is
+#          ever sent, so this never starts a conversation)
+#   carry  flags WITH a value copied from the original command (model,
+#          permission mode, ...); carry_bare: bare flags copied. Nothing is ever
+#          added: permission-skipping flags only come back if they were there.
+#   skip   flags / subcommands meaning a one-shot, non-interactive run
+#   fd     regex over the agent's open files whose group 1 is the session id
+AGENTS = {
+    "claude": dict(bins=["claude"], pkg=["@anthropic-ai/claude-code", "/installs/claude/"],
+                   ids=["--resume", "-r"], resume=["--resume", "{id}"], cont=["--continue"],
+                   carry=["--model", "--permission-mode", "--add-dir", "--agent", "--settings",
+                          "--mcp-config", "--fallback-model"],
+                   carry_bare=["--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
+                               "--ide", "--chrome", "--verbose"],
+                   skip=["-p", "--print"],
+                   fd=r"/\.claude/projects/[^/]+/([0-9a-fA-F-]{36})\.jsonl$"),
+    "codex": dict(bins=["codex"], pkg=["@openai/codex", "/installs/codex/"],
+                  sub="resume", resume=["resume", "{id}"], cont=["resume", "--last"],
+                  carry=["--model", "-m", "--sandbox", "-s", "--ask-for-approval", "-a", "--profile", "-p"],
+                  carry_bare=["--dangerously-bypass-approvals-and-sandbox", "--yolo", "--full-auto", "--search"],
+                  skip=["exec", "e", "apply", "login", "logout", "mcp", "completion", "app-server", "cloud"],
+                  fd=r"rollout-[^/]*-([0-9a-fA-F]{8}-[0-9a-fA-F-]{27})\.jsonl$"),
+    "grok": dict(bins=["grok"], pkg=["/installs/grok/", "/.grok/bin/"],
+                 ids=["--resume", "-r", "--session-id", "-s"], resume=["--resume", "{id}"], cont=["--continue"],
+                 carry=["--model", "-m", "--permission-mode", "--sandbox"], carry_bare=["--always-approve"],
+                 skip=["-p", "--print", "--prompt"],
+                 fd=r"/\.grok/sessions/[^/]+/([0-9a-fA-F-]{32,36})/"),
+    "cursor-agent": dict(bins=["cursor-agent"], pkg=["cursor-agent"],
+                         ids=["--resume"], resume=["--resume", "{id}"], cont=["--continue"],
+                         carry=["--model", "-m", "--sandbox"],
+                         carry_bare=["-f", "--force", "--yolo", "--approve-mcps", "--trust", "--browser"],
+                         skip=["-p", "--print", "login", "logout", "status", "mcp", "update", "ls"],
+                         fd=r"/\.cursor/chats/[^/]+/([0-9a-fA-F-]{36})/"),
+    "gemini": dict(bins=["gemini"], pkg=["@google/gemini-cli"],
+                   ids=["--resume", "-r"], resume=["--resume", "{id}"], cont=["--resume", "latest"],
+                   carry=["--model", "-m", "--approval-mode"], carry_bare=["--yolo", "-y", "--sandbox", "-s"],
+                   skip=["-p", "--prompt"]),
+    "opencode": dict(bins=["opencode"], pkg=["opencode-ai", "/installs/opencode/"],
+                     ids=["--session", "-s"], resume=["--session", "{id}"], cont=["--continue"],
+                     carry=["--model", "-m", "--agent"], skip=["run", "serve", "auth", "mcp"]),
+    "kilo": dict(bins=["kilo", "kilocode"], pkg=["@kilocode/cli"],
+                 ids=["--session", "-s"], resume=["--session", "{id}"], cont=["--continue"],
+                 carry=["--model", "-m"]),
+    "kimi": dict(bins=["kimi"], pkg=["@moonshot-ai/kimi-code", "kimi_cli", "kimi-cli"],
+                 ids=["--session", "-S"], resume=["--session", "{id}"], cont=["--continue"],
+                 carry=["--model", "-m"], carry_bare=["--yolo", "-y", "--auto"],
+                 skip=["-p", "--print", "--prompt"],
+                 fd=r"/\.kimi/sessions/[^/]+/([0-9a-fA-F-]{32,36})"),
+    "qwen": dict(bins=["qwen"], pkg=["@qwen-code/qwen-code"],
+                 ids=["--resume", "-r"], resume=["--resume", "{id}"], cont=["--continue"],
+                 carry=["--model", "-m", "--approval-mode"], carry_bare=["--yolo", "-y"], skip=["-p", "--prompt"]),
+    "copilot": dict(bins=["copilot"], pkg=["@github/copilot"],
+                    ids=["--resume"], resume=["--resume={id}"], cont=["--continue"],
+                    carry=["--model", "--agent"],
+                    carry_bare=["--allow-all-tools", "--allow-all-paths", "--allow-all", "--yolo"],
+                    skip=["-p", "--prompt"]),
+    "droid": dict(bins=["droid"], pkg=["@factory/cli"], ids=["--resume", "-r"], resume=["--resume", "{id}"],
+                  cont=None, carry=["--model", "-m"], skip=["exec"]),
+    "devin": dict(bins=["devin"], ids=["--resume"], resume=["--resume", "{id}"], cont=None),
+    "qodercli": dict(bins=["qodercli"], ids=["--resume", "-r"], resume=["--resume", "{id}"], cont=["--continue"]),
+    "hermes": dict(bins=["hermes"], ids=["--resume"], resume=["--resume", "{id}"], cont=None),
+    "pi": dict(bins=["pi"], pkg=["@mariozechner/pi-coding-agent"], ids=["--session"],
+               resume=["--session", "{id}"], cont=["--continue"], carry=["--model", "--provider"],
+               skip=["-p", "--print"]),
+    "omp": dict(bins=["omp"], ids=["--resume"], resume=["--resume={id}"], cont=None),
+    "agy": dict(bins=["agy"], ids=["--conversation"], resume=["--conversation", "{id}"], cont=None),
+    "letta": dict(bins=["letta"], pkg=["@letta-ai/letta-code"], ids=["--conversation"],
+                  resume=["--conversation", "{id}"], cont=["--continue"]),
+    "mastracode": dict(bins=["mastracode"], ids=["--thread"], resume=["--thread", "{id}"], cont=None),
+    "crush": dict(bins=["crush"], pkg=["/installs/crush/"], resume=None, cont=None,
+                  carry_bare=["--yolo", "-y"], skip=["run", "logs"]),
+    "aider": dict(bins=["aider"], pkg=["aider-chat", "/aider/"], resume=None, cont=["--restore-chat-history"],
+                  carry=["--model"], carry_bare=["--yes-always"], skip=["--message", "-m", "--message-file"]),
+    "goose": dict(bins=["goose"], pkg=["/goose/"], resume=["session", "--resume", "--session-id", "{id}"],
+                  cont=["session", "--resume"], skip=["run"]),
+    "amp": dict(bins=["amp"], pkg=["@sourcegraph/amp"], resume=["threads", "continue", "{id}"],
+                cont=["threads", "continue"], carry_bare=["--dangerously-allow-all"], skip=["-x", "--execute"]),
+}
+INTERPRETERS = re.compile(r"(node|nodejs|bun|deno|python3?(\.\d+)?)$")
+
+
+def flag_value(args, flags):
+    """Value of the first of `flags` (--f=v or --f v): None if absent, '' if bare."""
+    for i, a in enumerate(args):
+        if a == "--":
+            break
+        for f in flags:
+            if a == f:
+                nxt = args[i + 1] if i + 1 < len(args) else ""
+                return "" if (not nxt or nxt.startswith("-")) else nxt
+            if a.startswith(f + "=") and f.startswith("--"):
+                return a[len(f) + 1:]
+    return None
+
+
+def carried_flags(args, spec):
+    out, i = [], 0
+    bare, valued = spec.get("carry_bare", []), spec.get("carry", [])
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            break
+        if a in bare:
+            out.append(a)
+        elif a in valued and i + 1 < len(args):
+            out += [a, args[i + 1]]
+            i += 1
+        elif "=" in a and a.split("=", 1)[0] in valued and a.startswith("--"):
+            out.append(a)
+        i += 1
+    return out
+
+
+def match_agent(pid):
+    """(name, spec, args-after-program, bin) if pid is a known coding agent."""
+    argv = cmdline(pid)
+    if not argv or is_shell(pid):
+        return None
+    exe = exe_of(pid)
+    b0 = base(argv[0])
+    interp = bool(INTERPRETERS.match(b0)) or bool(INTERPRETERS.match(base(exe)))
+    entry_i = None
+    if interp:
+        for i, a in enumerate(argv[1:], 1):
+            if a in ("-m", "-c"):
+                entry_i = i + 1 if a == "-m" else None
+                break
+            if not a.startswith("-"):
+                entry_i = i
+                break
+    for name, spec in AGENTS.items():
+        bins, pkg = spec["bins"], spec.get("pkg", [])
+        if b0 in bins:
+            return name, spec, argv[1:], b0
+        if not interp and (base(exe) in bins or any(m in exe or m in argv[0] for m in pkg)):
+            return name, spec, argv[1:], bins[0]
+        if interp and entry_i is not None and entry_i < len(argv):
+            e = argv[entry_i]
+            if base(e) in bins or any(m in e for m in pkg) or e.replace("_", "-") in bins:
+                return name, spec, argv[entry_i + 1:], bins[0]
+    return None
+
+
+def fd_match(pid, rx):
+    rx = re.compile(rx)
+    found = None
+    for pid_ in [pid] + children(pid):
+        for fd in glob.glob(f"/proc/{pid_}/fd/*"):
+            try:
+                m = rx.search(os.readlink(fd))
+            except OSError:
+                continue
+            if m:
+                found = m.group(1)
+    return found
+
+
+NO_CONVERSATION = "no conversation yet"
+
+
+def agent_session_id(name, spec, pid, args, cwd):
+    """(id, where it came from) or (None, ''). Live state (session registries,
+    open transcript files) wins over the command line, because the user may
+    have switched conversations (/new, /resume) since the agent started."""
+    try:
+        if name == "grok":
+            with open(os.path.join(HOME, ".grok", "active_sessions.json")) as f:
+                data = json.load(f)
+            mine = [e for e in (data if isinstance(data, list) else data.get("sessions", []))
+                    if isinstance(e, dict) and e.get("pid") == pid and e.get("session_id")]
+            mine.sort(key=lambda e: str(e.get("opened_at", "")))
+            if mine and ID_RE.fullmatch(str(mine[-1]["session_id"])):
+                return str(mine[-1]["session_id"]), "~/.grok/active_sessions.json"
+            if not mine and not fd_match(pid, spec["fd"]):
+                # grok registers a session when the first message is sent
+                return None, NO_CONVERSATION
+        if name == "claude":
+            p = os.path.join(HOME, ".claude", "sessions", f"{pid}.json")
+            if os.path.exists(p):
+                with open(p) as f:
+                    sid = str(json.load(f).get("sessionId", ""))
+                if ID_RE.fullmatch(sid):
+                    return sid, "~/.claude/sessions"
+    except (OSError, ValueError, AttributeError):
+        pass
+    if spec.get("fd"):
+        v = fd_match(pid, spec["fd"])
+        if v and ID_RE.fullmatch(v):
+            return v, "open session file"
+    v = None
+    if spec.get("sub") and args[:1] == [spec["sub"]]:
+        v = args[1] if len(args) > 1 and not args[1].startswith("-") else None
+    elif spec.get("ids"):
+        v = flag_value(args, spec["ids"])
+    if v and ID_RE.fullmatch(v):
+        return v, "command line"
+    if name == "claude" and cwd:
+        d = os.path.join(HOME, ".claude", "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd))
+        started = proc_start_epoch(pid)
+        files = [(os.path.getmtime(f), f) for f in glob.glob(os.path.join(d, "*.jsonl"))]
+        files = [x for x in files if x[0] >= started - 5]
+        if files:
+            sid = base(max(files)[1])[:-len(".jsonl")]
+            if ID_RE.fullmatch(sid):
+                return sid, "newest transcript for this directory"
+    return None, ""
+
+
+def agent_resume(shell_pid):
+    """How to restart the coding agent running in this shell, or None."""
+    kids = children(shell_pid)
+    if not kids:
+        return None
+    queue = [(kids[-1], 0)]
+    while queue:
+        pid, depth = queue.pop(0)
+        m = match_agent(pid)
+        if m:
+            name, spec, args, prog = m
+            if any(a in spec.get("skip", []) for a in args[:1]) or \
+               any(a in spec.get("skip", []) for a in args if a.startswith("-")):
+                return None
+            cwd = cwd_of(pid)
+            sid, src = agent_session_id(name, spec, pid, args, cwd)
+            if sid and spec.get("resume"):
+                tail = [x.replace("{id}", sid) for x in spec["resume"]]
+                label = f"{name} — resume session {sid} (id from {src})"
+            elif src == NO_CONVERSATION:
+                tail = []
+                label = f"{name} — start fresh (it had no conversation yet; no prompt is sent)"
+            elif spec.get("cont"):
+                tail = list(spec["cont"])
+                label = f"{name} — continue latest session in this directory (no id found)"
+            else:
+                tail = []
+                label = f"{name} — restart (no resume support known; no prompt is sent)"
+            carry = carried_flags(args, spec)
+            argv = [prog] + (tail + carry if tail and not tail[0].startswith("-") else carry + tail)
+            return {"resume": argv, "label": label, "cwd": cwd, "agent": name}
+        if depth < 2:
+            queue += [(k, depth + 1) for k in reversed(children(pid))]
+    return None
+
+
+def proc_start_epoch(pid):
+    try:
+        with open("/proc/stat") as f:
+            bt = next(int(ln.split()[1]) for ln in f if ln.startswith("btime "))
+    except (OSError, StopIteration, ValueError):
+        return 0
+    return bt + stat_of(pid)["start"] / os.sysconf("SC_CLK_TCK")
+
+
+def shell_hook_state(pid):
+    """(hooked, atuin_session) as recorded by shell/session-hook.sh for this shell."""
+    p = os.path.join(RUNTIME_DIR, f"shell-{pid}")
+    try:
+        st = os.stat(p)
+        if st.st_uid != os.getuid() or st.st_mtime + 2 < proc_start_epoch(pid):
+            return False, ""   # stale file from an earlier process with the same pid
+        with open(p) as f:
+            v = f.read(100).strip()
+    except OSError:
+        return False, ""
+    return True, (v if ATUIN_RE.fullmatch(v) else "")
+
+
+def cleanup_shell_files():
+    for p in glob.glob(os.path.join(RUNTIME_DIR, "shell-*")):
+        n = base(p)[6:]
+        if n.isdigit() and not os.path.exists(f"/proc/{n}"):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def shell_info(cfg, k):
+    cwd = cwd_of(k) or HOME
+    hooked, atuin = shell_hook_state(k)
+    resume, label = resume_argv(cfg, k), ""
+    if resume:
+        label = base(resume[0])
+    elif cfg.get("resume_agents", True):
+        ag = agent_resume(k)
+        if ag:
+            resume, label = ag["resume"], ag["label"]
+            cwd = ag["cwd"] or cwd
+    return {"pid": k, "start": stat_of(k)["start"], "cwd": cwd, "resume": resume,
+            "label": label, "atuin": atuin, "hooked": hooked}
+
+
+def title_paths(title):
+    """Candidate directories mentioned in a terminal title like 'host: ~/src'."""
+    cands = []
+    for part in re.split(r"[:\s—–|]+\s*", title) + [title]:
+        part = part.strip()
+        if part.startswith("~"):
+            cands.append(os.path.expanduser(part))
+        elif part.startswith("/"):
+            cands.append(part)
+    return [os.path.normpath(c) for c in cands]
+
+
+def terminal_base_argv(term_key, spec, pargv, desk_entry):
+    if spec and spec.get("launcher"):
+        b = shutil.which(spec["launcher"]) or spec["launcher"]
+        return [b]
+    if desk_entry:
+        return list(desk_entry["argv"])
+    if not pargv:
+        return []
+    keep = set((spec or {}).get("keep", []))
+    out = [pargv[0]]
+    dirflag = (spec or {}).get("dir", ("",))[-1] if spec and spec["dir"][0] in ("eq", "sep") else None
+    skip_next = False
+    for a in pargv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if spec and a == spec.get("exec"):
+            break
+        if dirflag and (a == dirflag):
+            skip_next = True
+            continue
+        if dirflag and a.startswith(dirflag + "="):
+            continue
+        if a.startswith("--") and "=" in a or a in keep:
+            out.append(a)
+    return out
+
+
+def terminal_launch(term_key, spec, base_argv, cwd, resume, default_ids, desk_entry):
+    # Run a resumed program inside the user's shell so the window stays open
+    # afterwards. The script is constant; the program is passed as "$@".
+    cmd = None
+    if resume:
+        sh = os.environ.get("SHELL") or "/bin/bash"
+        cmd = [sh, "-c", '"$@"; exec "${SHELL:-/bin/bash}"', "omarchy-session"] + list(resume)
+    if spec is None:
+        if desk_entry and default_ids and desk_entry["id"] in default_ids[:1] and shutil.which("xdg-terminal-exec"):
+            return ["xdg-terminal-exec", f"--dir={cwd}"] + (cmd or [])
+        return ["env", "-C", cwd] + base_argv + (["-e"] + cmd if cmd else [])
+    drop = spec.get("drop", [])
+    base_argv = [a for i, a in enumerate(base_argv)
+                 if i == 0 or not any(a == d or a.startswith(d + "=") for d in drop)] + spec.get("add", [])
+    style = spec["dir"]
+    if style[0] == "wezterm":
+        return [base_argv[0] if base_argv else "wezterm", "start", "--cwd", cwd] + (["--"] + cmd if cmd else [])
+    if style[0] == "eq":
+        argv = list(base_argv) + [f"{style[1]}={cwd}"]
+    elif style[0] == "sep":
+        argv = list(base_argv) + [style[1], cwd]
+    else:
+        argv = ["env", "-C", cwd] + list(base_argv)
+    if cmd:
+        argv += ([spec["exec"]] if spec.get("exec") else []) + cmd
+    return argv
+
+
+def window_record(c):
+    ws = c.get("workspace") or {}
+    try:
+        sid = int(str(c.get("stableId", "0")), 16)
+    except ValueError:
+        sid = 0
+    return {
+        "title": c.get("title", ""),
+        "workspace": ws.get("id"),
+        "ws_name": ws.get("name", ""),
+        "monitor": c.get("monitor"),
+        "floating": bool(c.get("floating")),
+        "fullscreen": int(c.get("fullscreen") or 0),
+        "pinned": bool(c.get("pinned")),
+        "at": c.get("at"),
+        "size": c.get("size"),
+        "stable": sid,
+    }
+
+
+def snapshot(cfg):
+    clients = hypr_json("clients")
+    monitors = hypr_json("monitors")
+    desk = DesktopIndex()
+    default_ids = default_terminal_ids()
+    skip = [re.compile(p) for p in cfg["skip_classes"]]
+    by_pid = {}
+    skipped = []
+    for c in clients:
+        cls = c.get("class") or c.get("initialClass") or ""
+        ws = (c.get("workspace") or {}).get("id")
+        if not c.get("mapped", True) or c.get("hidden"):
+            continue
+        if not isinstance(ws, int) or ws <= 0:
+            skipped.append((cls, "special workspace"))
+            continue
+        if c.get("pid", 0) <= 0:
+            skipped.append((cls, "no pid"))
+            continue
+        if any(p.fullmatch(cls) for p in skip):
+            skipped.append((cls, "skip_classes"))
+            continue
+        mp = main_process(c["pid"])
+        by_pid.setdefault(mp, []).append(c)
+
+    items = []
+    browsers = {}
+    for pid, cs in by_pid.items():
+        pargv, pexe = cmdline(pid), exe_of(pid)
+        pbase = proc_basename(pargv, pexe)
+        names = [pbase, base(pexe)]
+        # group this process's windows by class
+        classes = {}
+        for c in cs:
+            classes.setdefault(c.get("class") or c.get("initialClass") or "", []).append(c)
+        for cls, wins in classes.items():
+            wins.sort(key=lambda c: window_record(c)["stable"])
+            desk_e = desk.for_class(cls, names)
+
+            # ---- web app (chromium --app window with its own class)
+            m = WEBAPP_CLASS.match(cls)
+            if m and (pbase in BROWSER_BINS or base(pexe) in BROWSER_BINS or "chrome" in pexe):
+                we = desk.webapp_for_class(cls)
+                strategy = ""
+                if we:
+                    argv, strategy = list(we["argv"]), f"desktop file {we['id']}"
+                else:
+                    url = webapp_url_from_argv(pargv)
+                    app = m.group("app")
+                    if not url and re.fullmatch(r"[a-p]{32}", app):
+                        argv = [pargv[0] if pargv else pexe, f"--app-id={app}"]
+                        strategy = "installed PWA app id"
+                    else:
+                        if not url:
+                            host, _, path = app.partition("_")
+                            url = "https://" + host + "/" + path.replace("_", "/").lstrip("/")
+                        argv = [pargv[0] if pargv else pexe, f"--app={url}"]
+                        strategy = "browser --app"
+                    prof = m.group("profile")
+                    if prof != "Default":
+                        argv.append("--profile-directory=" + prof.replace("_", " "))
+                for c in wins:
+                    items.append({"kind": "webapp", "class": cls, "argv": argv,
+                                  "strategy": strategy, "windows": [window_record(c)]})
+                continue
+
+            # ---- browser
+            if (desk_e and "WebBrowser" in desk_e["cats"]) or pbase in BROWSER_BINS or base(pexe) in BROWSER_BINS:
+                if desk_e and "WebBrowser" in desk_e["cats"]:
+                    argv, strategy = list(desk_e["argv"]), f"desktop file {desk_e['id']}"
+                else:
+                    argv = [a for a in pargv if "://" not in a and not a.startswith(("--app=", "--app-id="))]
+                    strategy = "process cmdline"
+                key = (cls, tuple(argv))
+                if key not in browsers:
+                    browsers[key] = {"kind": "browser", "class": cls, "argv": argv,
+                                     "strategy": strategy + "; browser reopens its own windows, matched by title",
+                                     "windows": []}
+                    items.append(browsers[key])
+                browsers[key]["windows"] += [window_record(c) for c in wins]
+                continue
+
+            # ---- terminal
+            term_key, spec = terminal_spec(cls, pbase, desk_e)
+            if (term_key and spec and pbase in TERMINALS and cls not in spec["classes"]
+                    and cls.lower() not in [x.lower() for x in spec["classes"]]
+                    and not (desk_e and "TerminalEmulator" in desk_e["cats"])):
+                # a TUI app running in its own terminal window with a custom class
+                if len(classes) > 1:
+                    skipped.append((cls, "custom-class window of a shared terminal process"))
+                    continue
+                items.append({"kind": "app", "class": cls, "argv": list(pargv),
+                              "strategy": "process cmdline (terminal with custom class)",
+                              "windows": [window_record(c) for c in wins]})
+                continue
+            if term_key and (spec is None or cls in spec["classes"] or
+                             cls.lower() in [x.lower() for x in spec["classes"]] or
+                             (desk_e and "TerminalEmulator" in desk_e["cats"])):
+                tdesk = desk_e if (desk_e and "TerminalEmulator" in desk_e["cats"]) else None
+                base_argv = terminal_base_argv(term_key, spec, pargv, tdesk)
+                kids = children(pid)
+                shells = [k for k in kids if is_shell(k)] or kids
+                info = [shell_info(cfg, k) for k in shells]
+                assigned = {}
+                free = list(range(len(info)))
+                if len(info) != len(wins):
+                    # title -> cwd match first when counts disagree
+                    for wi, c in enumerate(wins):
+                        for path in title_paths(c.get("title", "")):
+                            hits = [i for i in free if os.path.normpath(info[i]["cwd"]) == path]
+                            if len(hits) == 1:
+                                assigned[wi] = hits[0]
+                                free.remove(hits[0])
+                                break
+                for wi in range(len(wins)):
+                    if wi not in assigned and free:
+                        assigned[wi] = free.pop(0)
+                # Shells left over are tabs/splits. Nothing exposes which window a
+                # tab belongs to, so attach each to the window whose first shell
+                # started most recently before it (tabs are opened after their window).
+                extra = {}
+                prim = {wi: info[i]["start"] for wi, i in assigned.items()}
+                for i in free:
+                    st = info[i]["start"]
+                    before = [wi for wi in prim if prim[wi] <= st]
+                    if before:
+                        extra.setdefault(max(before, key=lambda w: prim[w]), []).append(info[i])
+                    elif prim:
+                        extra.setdefault(min(prim, key=lambda w: prim[w]), []).append(info[i])
+                for wi, c in enumerate(wins):
+                    sh = info[assigned[wi]] if wi in assigned else {
+                        "cwd": cwd_of(pid) or HOME, "resume": None, "label": "", "atuin": "", "hooked": False}
+                    tabs = []
+                    for t in [sh] + sorted(extra.get(wi, []), key=lambda t: t["start"]):
+                        tabs.append({"cwd": t["cwd"], "atuin": t["atuin"], "hooked": t["hooked"],
+                                     "resume": t["resume"], "label": t["label"],
+                                     "argv": terminal_launch(term_key, spec, base_argv, t["cwd"], t["resume"],
+                                                             default_ids, tdesk)})
+                    items.append({"kind": "terminal", "class": cls, "term": term_key,
+                                  "argv": tabs[0]["argv"], "cwd": sh["cwd"], "resume": sh["resume"],
+                                  "plain_argv": terminal_launch(term_key, spec, base_argv, sh["cwd"], None,
+                                                                default_ids, tdesk),
+                                  "tabs": tabs,
+                                  "strategy": f"{term_key} working-directory flag" if spec else "generic terminal",
+                                  "windows": [window_record(c)]})
+                continue
+
+            # ---- everything else
+            argv, strategy = None, ""
+            fid = flatpak_id(pid)
+            appimage = environ_var(pid, "APPIMAGE")
+            if fid:
+                argv, strategy = ["flatpak", "run", fid], "flatpak"
+            elif appimage and os.path.exists(appimage):
+                argv, strategy = [appimage] + pargv[1:], "AppImage"
+            elif (pargv and os.path.isabs(pargv[0]) and os.access(pargv[0], os.X_OK)
+                  and not pargv[0].startswith(("/tmp/", "/run/", "/proc/")) and not pexe.endswith(" (deleted)")):
+                argv, strategy = list(pargv), "process cmdline"
+            elif pargv and not os.path.isabs(pargv[0]) and shutil.which(pargv[0]):
+                argv, strategy = list(pargv), "process cmdline"
+            elif desk_e:
+                argv, strategy = list(desk_e["argv"]), f"desktop file {desk_e['id']}"
+            if not argv:
+                skipped.append((cls, "no launch command found"))
+                continue
+            if len(wins) > 1:
+                strategy += f"; launched once, {len(wins)} windows matched by title"
+            items.append({"kind": "app", "class": cls, "argv": argv, "strategy": strategy,
+                          "desktop_id": desk_e["id"] if desk_e else "",
+                          "windows": [window_record(c) for c in wins]})
+
+    return {
+        "format": FORMAT,
+        "version": VERSION,
+        "saved_at": time.time(),
+        "instance": instance_sig(),
+        "boot_id": boot_id(),
+        "monitors": [{"id": m.get("id"), "name": m.get("name"), "width": m.get("width"),
+                      "height": m.get("height")} for m in monitors],
+        "items": items,
+        "skipped": [{"class": c, "reason": r} for c, r in skipped],
+    }
+
+
+# ----------------------------------------------------------------- saving --
+def frozen():
+    try:
+        with open(FREEZE) as f:
+            return time.time() < float(f.read().strip())
+    except (OSError, ValueError):
+        return False
+
+
+def shutting_down():
+    rc, out = run(["systemctl", "is-system-running"], timeout=3)
+    if out.strip() == "stopping":
+        return True
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            a = cmdline(d)
+            for i, x in enumerate(a[:-1]):
+                if base(x) == "omarchy-system" and a[i + 1] in ("reboot", "shutdown", "logout"):
+                    return True
+    return False
+
+
+def windows_count(sess):
+    return sum(len(i["windows"]) for i in sess.get("items", []))
+
+
+def save(final=False, reason="manual"):
+    cfg = load_config()
+    if not cfg["enabled"]:
+        log(f"save ({reason}): plugin disabled, not saving", echo=True)
+        return 0
+    ensure_dirs()
+    with open_lock(SAVE_LOCK) as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        if not final:
+            if frozen():
+                log(f"save ({reason}): frozen after a final save, skipping")
+                return 0
+            if shutting_down():
+                log(f"save ({reason}): system is shutting down, skipping")
+                return 0
+        cleanup_shell_files()
+        sess = snapshot(cfg)
+        n = windows_count(sess)
+        if n == 0 and not final:
+            log(f"save ({reason}): no windows, keeping previous session")
+            return 0
+        old = None
+        try:
+            with open(SESSION) as f:
+                old = json.load(f)
+        except (OSError, ValueError):
+            pass
+        if old and old.get("items") == sess["items"] and old.get("instance") == sess["instance"]:
+            os.utime(SESSION)
+            msg = "unchanged"
+        else:
+            atomic_write(SESSION, json.dumps(sess, indent=1) + "\n", 0o600,
+                         keep_prev=PREV if old else None)
+            msg = "written"
+        if final:
+            atomic_write(FREEZE, str(time.time() + 120), 0o600)
+        log(f"save ({reason}{', final' if final else ''}): {n} windows, {msg}", echo=not QUIET and reason == "manual")
+        return 0
+
+
+
+# ------------------------------------------------------ shell hook / tabs --
+def make_queue(tabs):
+    """Per-launch queue of tab states, claimed in order by session-hook.sh."""
+    os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+    fd, path = tempfile.mkstemp(dir=RUNTIME_DIR, prefix="queue-", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump({"created": time.time(), "claimed": 0,
+                   "tabs": [{"cwd": t["cwd"], "atuin": t.get("atuin") or "", "resume": t.get("resume")}
+                            for t in tabs]}, f)
+    return path
+
+
+def queue_claimed(path):
+    try:
+        with open(path) as f:
+            return int(json.load(f).get("claimed", 0))
+    except (OSError, ValueError, AttributeError):
+        return 0
+
+
+def wait_claims(path, n, timeout):
+    end = time.time() + timeout
+    while time.time() < end:
+        if queue_claimed(path) >= n:
+            return True
+        time.sleep(0.15)
+    return False
+
+
+def shell_code(t):
+    """Shell code for one restored tab. Every value is validated and quoted."""
+    out = []
+    cwd = t.get("cwd")
+    if isinstance(cwd, str) and os.path.isdir(cwd):
+        out.append(f"cd -- {shlex.quote(cwd)} 2>/dev/null")
+    at = t.get("atuin") or ""
+    if isinstance(at, str) and ATUIN_RE.fullmatch(at):
+        out.append(f"export ATUIN_SESSION={at} ATUIN_SHLVL=\"$SHLVL\"")
+    r = t.get("resume")
+    if valid_argv(r):
+        out.append("__osr_resume=(" + " ".join(shlex.quote(x) for x in r) + ")")
+        out.append("__osr_arm")
+    return "\n".join(out)
+
+
+def claim_tab(path):
+    real = os.path.realpath(path)
+    if os.path.dirname(real) != os.path.realpath(RUNTIME_DIR) or not base(real).startswith("queue-"):
+        return 2
+    try:
+        st = os.stat(real)
+        if st.st_uid != os.getuid() or st.st_mode & 0o077 or time.time() - st.st_mtime > 600:
+            return 2
+        with open(real, "r+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            q = json.load(f)
+            i, tabs = int(q.get("claimed", 0)), q.get("tabs", [])
+            if i >= len(tabs):
+                return 0
+            q["claimed"] = i + 1
+            f.seek(0)
+            f.truncate()
+            json.dump(q, f)
+    except (OSError, ValueError, AttributeError):
+        return 1
+    if isinstance(tabs[i], dict):
+        print(shell_code(tabs[i]))
+    return 0
+
+
+def dbus_name_for_pid(pid):
+    rc, out = run(["busctl", "--user", "list", "--no-legend"])
+    if rc != 0:
+        return None
+    for ln in out.splitlines():
+        f = ln.split()
+        if len(f) > 1 and f[0].startswith(":") and f[1] == str(pid):
+            return f[0]
+    return None
+
+
+def ghostty_window_path(name):
+    rc, out = run(["gdbus", "introspect", "--session", "--dest", name, "--object-path", "/com/mitchellh/ghostty/window"])
+    nodes = sorted(int(m) for m in re.findall(r"^\s*node (\d+)", out, re.M)) if rc == 0 else []
+    return f"/com/mitchellh/ghostty/window/{nodes[-1]}" if nodes else None
+
+
+def rc_files():
+    out = []
+    zd = os.environ.get("ZDOTDIR") or HOME
+    for p in (os.path.join(HOME, ".bashrc"), os.path.join(zd, ".zshrc")):
+        if os.path.isfile(p):
+            out.append(p)
+    return out
+
+
+def hook_line():
+    q = shlex.quote(HOOK_FILE)
+    return f"[ -f {q} ] && . {q}  {HOOK_MARK}\n"
+
+
+def hook_installed():
+    if not os.path.isfile(HOOK_FILE):
+        return False
+    for rc in rc_files():
+        try:
+            with open(rc) as f:
+                if HOOK_MARK in f.read():
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def install_hook(args):
+    files = rc_files()
+    if not files:
+        print("no ~/.bashrc or ~/.zshrc found")
+        return 1
+    for rc in files:
+        with open(rc) as f:
+            lines = f.readlines()
+        if any(HOOK_MARK in ln for ln in lines):
+            print(f"{rc}: hook already installed")
+            continue
+        at = [i for i, ln in enumerate(lines) if re.search(r"atuin\s+init", ln) and not ln.lstrip().startswith("#")]
+        idx = at[-1] + 1 if at else len(lines)
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.insert(idx, hook_line())
+        bak = rc + ".bak-session-restore-" + time.strftime("%Y%m%d-%H%M%S")
+        shutil.copy2(rc, bak)
+        atomic_write(rc, "".join(lines), mode=os.stat(rc).st_mode & 0o777)
+        print(f"{rc}: hook added at line {idx + 1}" + (" (after atuin init)" if at else "") + f"; backup {bak}")
+    print("New shells pick it up; already-open terminals keep working but are only fully tracked once restarted.")
+    return 0
+
+
+def uninstall_hook(args):
+    for rc in rc_files():
+        with open(rc) as f:
+            lines = f.readlines()
+        keep = [ln for ln in lines if HOOK_MARK not in ln]
+        if len(keep) != len(lines):
+            atomic_write(rc, "".join(keep), mode=os.stat(rc).st_mode & 0o777)
+            print(f"{rc}: hook removed")
+    return 0
+
+
+# --------------------------------------------------------------- restore --
+def load_session(path):
+    st = os.stat(path)
+    if st.st_uid != os.getuid():
+        raise ValueError(f"{path} is not owned by you")
+    if st.st_mode & 0o022:
+        raise ValueError(f"{path} is group/world writable; refusing")
+    with open(path) as f:
+        sess = json.load(f)
+    if not isinstance(sess, dict) or sess.get("format") != FORMAT or not isinstance(sess.get("items"), list):
+        raise ValueError(f"{path}: unknown format")
+    for it in sess["items"]:
+        a = it.get("argv")
+        if (not isinstance(a, list) or not a or not all(isinstance(x, str) and "\0" not in x for x in a)
+                or it.get("kind") not in ("terminal", "browser", "webapp", "app")
+                or not isinstance(it.get("windows"), list) or not it["windows"]):
+            raise ValueError(f"{path}: invalid entry {str(it)[:120]}")
+        if not valid_argv(it.get("plain_argv"), optional=True) or not isinstance(it.get("tabs", []), list):
+            raise ValueError(f"{path}: invalid terminal entry {str(it)[:120]}")
+        for t in it.get("tabs", []):
+            if (not isinstance(t, dict) or not isinstance(t.get("cwd"), str) or not valid_argv(t.get("argv"))
+                    or not valid_argv(t.get("resume"), optional=True) or not isinstance(t.get("atuin", ""), str)):
+                raise ValueError(f"{path}: invalid tab {str(t)[:120]}")
+    return sess
+
+
+def valid_argv(a, optional=False):
+    if a is None:
+        return optional
+    return isinstance(a, list) and bool(a) and all(isinstance(x, str) and "\0" not in x for x in a)
+
+
+def filter_session(sess, workspaces):
+    """Only the windows on the given workspaces (ids or names)."""
+    want = set(str(w) for w in workspaces)
+    def on(w):
+        return ws_selector(w) in want or str(w.get("workspace")) in want or ("name:" + str(w.get("ws_name"))) in want
+    items = []
+    for it in sess["items"]:
+        if it["kind"] == "browser":
+            ws_ = [w for w in it["windows"] if on(w)]
+            if ws_:
+                items.append(dict(it, windows=ws_))
+        elif on(it["windows"][0]):
+            items.append(it)
+    return dict(sess, items=items)
+
+
+def sha_of(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def hypr_uptime():
+    """Seconds since this Hyprland instance started (None if unknown)."""
+    try:
+        for inst in hypr_json("instances"):
+            if inst.get("instance") == instance_sig():
+                st = stat_of(inst["pid"])["start"]
+                with open("/proc/uptime") as f:
+                    up = float(f.read().split()[0])
+                return up - st / os.sysconf("SC_CLK_TCK")
+    except Exception:
+        pass
+    return None
+
+
+def pick_session(cfg, args):
+    """Return (path, session, reason_to_skip_or_None)."""
+    if args.file:
+        return args.file, load_session(args.file), None
+    path = PREV if args.prev else SESSION
+    if not os.path.exists(path):
+        return None, None, "no saved session"
+    try:
+        sess = load_session(path)
+    except (ValueError, OSError) as e:
+        if path == SESSION and os.path.exists(PREV):
+            log(f"restore: {e}; falling back to {PREV}")
+            path = PREV
+            sess = load_session(PREV)
+        else:
+            raise
+    reason = None
+    age = time.time() - os.stat(path).st_mtime
+    last = {}
+    try:
+        with open(LAST_RESTORE) as f:
+            last = json.load(f)
+    except (OSError, ValueError):
+        pass
+    if not cfg["enabled"]:
+        reason = "plugin disabled"
+    elif sess.get("instance") == instance_sig():
+        reason = "session was saved by this same Hyprland session (nothing to restore)"
+    elif age > cfg["max_age_hours"] * 3600:
+        reason = f"session is stale ({fmt_age(age)} old > {cfg['max_age_hours']}h)"
+    elif last.get("sha") == sha_of(path):
+        reason = "this session was already restored"
+    elif not args.dry_run:
+        up = hypr_uptime()
+        if up is not None and up > cfg["max_login_age_seconds"]:
+            reason = f"Hyprland has been running {fmt_age(up)}; auto-restore only runs right after login"
+    return path, sess, reason
+
+
+def describe(sess, path):
+    age = time.time() - os.stat(path).st_mtime if path and os.path.exists(path) else 0
+    print(f"Session file: {path}")
+    print(f"Saved {time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime(sess.get('saved_at', 0)))}"
+          f" (last confirmed {fmt_age(age)} ago), Hyprland instance {str(sess.get('instance'))[:12]}…,"
+          f" {windows_count(sess)} windows in {len(sess['items'])} launch entries")
+
+
+def ordered_items(sess):
+    items = sess["items"]
+    def pos(it):
+        w = it["windows"][0]
+        at = w.get("at") or [0, 0]
+        return (w.get("workspace") or 0, at[0], at[1])
+    br = [i for i in items if i["kind"] == "browser"]
+    mid = sorted([i for i in items if i["kind"] in ("terminal", "app")], key=pos)
+    web = sorted([i for i in items if i["kind"] == "webapp"], key=pos)
+    return br + mid + web
+
+
+def primary_ws(it):
+    counts = {}
+    for w in it["windows"]:
+        s = ws_selector(w)
+        counts[s] = counts.get(s, 0) + 1
+    return max(counts, key=lambda s: (counts[s], -it["windows"].index(next(w for w in it["windows"] if ws_selector(w) == s))))
+
+
+def print_plan(sess):
+    use_uwsm = bool(shutil.which("uwsm-app"))
+    hooked = hook_installed()
+    if not hooked:
+        print("\nNote: the shell hook is not installed (omarchy-session install-hook), so terminals restore"
+              " their cwd and program but get new Atuin sessions.")
+    for n, it in enumerate(ordered_items(sess), 1):
+        k = it["kind"]
+        if k == "browser":
+            ws = primary_ws(it)
+            print(f"\n{n}. browser [{it['class']}] — launch once on workspace {ws}, "
+                  f"then place {len(it['windows'])} reopened windows by title ({it['strategy']}):")
+            for w in it["windows"]:
+                print(f"     ws {ws_selector(w):>3}  {'floating ' if w['floating'] else ''}\"{w['title'][:70]}\"")
+            print("     (skipped if a window of this browser already exists)")
+        else:
+            w = it["windows"][0]
+            extra = ""
+            if k == "terminal" and not it.get("tabs"):
+                extra = f", cwd {it.get('cwd')}" + (f", resumes: {shlex.join(it['resume'])}" if it.get("resume") else "")
+            print(f"\n{n}. {k} [{it['class']}] → workspace {ws_selector(w)}{extra} ({it['strategy']})")
+            for w2 in it["windows"]:
+                print(f"     ws {ws_selector(w2):>3}  {'floating ' if w2['floating'] else ''}\"{w2['title'][:70]}\"")
+            if k in ("app", "webapp"):
+                print("     (an existing window with this class is claimed instead of launching)")
+            if k == "terminal" and it.get("tabs"):
+                tabs = it["tabs"]
+                how = ""
+                if len(tabs) > 1:
+                    how = (" (opened as tabs of one window)" if it.get("term") == "ghostty" and hooked
+                           else " (extra tabs open as separate windows on the same workspace)")
+                print(f"     {len(tabs)} tab{'s' if len(tabs) > 1 else ''}{how}:")
+                for ti, t in enumerate(tabs, 1):
+                    at = ("Atuin session …" + t["atuin"][-12:]) if t.get("atuin") and hooked else \
+                         ("new Atuin session" + ("" if hooked else " (shell hook not installed)"))
+                    print(f"       tab {ti}: cwd {t['cwd']}; {at}")
+                    if t.get("resume"):
+                        print(f"              runs: {shlex.join(t['resume'])}" + (f"   [{t['label']}]" if t.get("label") else ""))
+                if hooked:
+                    print("     $ env OMARCHY_SR_QUEUE=<per-restore queue> " + shlex.join(it.get("plain_argv") or it["argv"]))
+                    continue
+        print("     $ " + shlex.join(it["argv"]))
+        print("     dispatch: " + exec_dispatch_string(it["argv"], primary_ws(it) if k == "browser" else ws_selector(it["windows"][0]), use_uwsm))
+    if sess.get("skipped"):
+        print("\nNot saved: " + ", ".join(f"{s['class']} ({s['reason']})" for s in sess["skipped"]))
+
+
+def norm_title(t):
+    t = re.sub(r"^\(\d[\d,]*\)\s*", "", t or "")
+    t = re.sub(r"\s+[-—–]\s+(Google Chrome|Chromium|Brave|Microsoft​? Edge|Vivaldi|Mozilla Firefox|Firefox|LibreWolf|Zen Browser|Helium)$", "", t)
+    return t.strip().lower()
+
+
+class Restorer:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.use_uwsm = bool(shutil.which("uwsm-app"))
+        self.known = {c["address"] for c in hypr_json("clients")}   # windows present before restore
+        self.claimed = set()
+        self.pending = []   # browser/app groups waiting for more windows
+        self.placed = 0
+        self.failed = []
+        self.hooked = hook_installed()
+        self.refocus = None
+        try:
+            self.prev_focus = (hypr_json("activewindow") or {}).get("address")
+        except Exception:
+            self.prev_focus = None
+
+    def clients(self):
+        try:
+            return hypr_json("clients")
+        except Exception:
+            return []
+
+    def unclaimed(self, cls, include_known=False):
+        out = []
+        for c in self.clients():
+            if c["address"] in self.claimed:
+                continue
+            if c["address"] in self.known and not include_known:
+                continue
+            if (c.get("class") or c.get("initialClass") or "").lower() == cls.lower():
+                out.append(c)
+        return out
+
+    def launch(self, argv, ws):
+        a = list(argv)
+        if a[0] not in ("env",) and not os.path.isabs(a[0]) and not shutil.which(a[0]):
+            log(f"restore: {a[0]} not found, skipping")
+            return False
+        return dispatch(exec_dispatch_string(a, ws, self.use_uwsm))
+
+    def place(self, c, w):
+        addr = "address:" + c["address"]
+        L = lua_long
+        self.claimed.add(c["address"])
+        ws = ws_selector(w)
+        cur = c.get("workspace") or {}
+        if ws_selector({"workspace": cur.get("id"), "ws_name": cur.get("name", "")}) != ws:
+            dispatch(f"hl.dsp.window.move({{ workspace = {L(ws)}, follow = false, window = {L(addr)} }})")
+        if bool(c.get("floating")) != bool(w.get("floating")):
+            dispatch(f"hl.dsp.window.float({{ action = {L('on' if w['floating'] else 'off')}, window = {L(addr)} }})")
+        if w.get("floating") and w.get("size") and w.get("at"):
+            dispatch(f"hl.dsp.window.resize({{ x = {int(w['size'][0])}, y = {int(w['size'][1])}, window = {L(addr)} }})")
+            dispatch(f"hl.dsp.window.move({{ x = {int(w['at'][0])}, y = {int(w['at'][1])}, window = {L(addr)} }})")
+        if w.get("fullscreen") and not c.get("fullscreen"):
+            mode = "maximized" if w["fullscreen"] == 1 else "fullscreen"
+            dispatch(f"hl.dsp.window.fullscreen({{ mode = {L(mode)}, window = {L(addr)} }})")
+        if w.get("pinned") and w.get("floating") and not c.get("pinned"):
+            dispatch(f"hl.dsp.window.pin({{ window = {L(addr)} }})")
+        self.placed += 1
+
+    def wait_new(self, cls, timeout):
+        end = time.time() + timeout
+        while time.time() < end:
+            new = self.unclaimed(cls)
+            if new:
+                return new[0]
+            self.step_pending(final=False)
+            time.sleep(0.25)
+        return None
+
+    def step_pending(self, final):
+        for g in list(self.pending):
+            cands = self.unclaimed(g["class"])
+            remaining = g["remaining"]
+            done = time.time() > g["deadline"] or final
+            if cands and remaining:
+                pairs = sorted(((difflib.SequenceMatcher(None, norm_title(c["title"]), norm_title(w["title"])).ratio(), ci, wi)
+                                for ci, c in enumerate(cands) for wi, w in enumerate(remaining)), reverse=True)
+                used_c, used_w = set(), set()
+                for score, ci, wi in pairs:
+                    if ci in used_c or wi in used_w:
+                        continue
+                    if score >= 0.8 or (done and score >= 0.4) or (done and len(remaining) == 1 and len(cands) == 1):
+                        self.place(cands[ci], remaining[wi])
+                        used_c.add(ci)
+                        used_w.add(wi)
+                g["remaining"] = [w for wi, w in enumerate(remaining) if wi not in used_w]
+            if not g["remaining"] or done:
+                for c in self.unclaimed(g["class"]):
+                    # leftovers stay where they opened (the launch workspace)
+                    self.claimed.add(c["address"])
+                if g["remaining"]:
+                    self.failed += [f"{g['class']}: \"{w['title'][:40]}\"" for w in g["remaining"]]
+                self.pending.remove(g)
+
+    def run(self, sess):
+        items = ordered_items(sess)
+        for it in items:
+            k, cls, wins = it["kind"], it["class"], it["windows"]
+            try:
+                if k == "browser":
+                    if self.unclaimed(cls, include_known=True):
+                        log(f"restore: {cls} already running; placing its windows by title")
+                        self.known -= {c["address"] for c in self.unclaimed(cls, include_known=True)}
+                    elif not self.launch(it["argv"], primary_ws(it)):
+                        self.failed.append(cls)
+                        continue
+                    self.pending.append({"class": cls, "remaining": list(wins),
+                                         "deadline": time.time() + self.cfg["browser_wait_seconds"]})
+                    continue
+                if k in ("app", "webapp"):
+                    existing = self.unclaimed(cls, include_known=True)
+                    if existing:
+                        self.place(existing[0], wins[0])
+                        if len(wins) > 1:
+                            self.known -= {c["address"] for c in existing}
+                            self.pending.append({"class": cls, "remaining": wins[1:], "deadline": time.time() + 10})
+                        continue
+                ws = ws_selector(wins[0])
+                if k == "terminal":
+                    self.run_terminal(it, ws)
+                    continue
+                argv = it["argv"]
+                if not self.launch(argv, ws):
+                    self.failed.append(cls)
+                    continue
+                timeout = self.cfg["terminal_wait_seconds"] if k == "terminal" else self.cfg["app_wait_seconds"]
+                c = self.wait_new(cls, timeout)
+                if not c:
+                    log(f"restore: no window appeared for {cls} within {timeout}s")
+                    self.failed.append(cls)
+                    continue
+                self.place(c, wins[0])
+                if len(wins) > 1:
+                    self.pending.append({"class": cls, "remaining": wins[1:],
+                                         "deadline": time.time() + self.cfg["app_wait_seconds"]})
+            except Exception as e:  # never let one entry stop the rest
+                log(f"restore: {cls}: {e!r}")
+                self.failed.append(cls)
+        while self.pending:
+            self.step_pending(final=False)
+            time.sleep(1)
+        if self.refocus and self.prev_focus:
+            dispatch(f"hl.dsp.focus({{ window = {lua_long('address:' + self.prev_focus)} }})")
+        return self.placed, self.failed
+
+    # ---- terminals: cwd, Atuin session, resumed program, tabs
+    @staticmethod
+    def fix_cwd(argv, cwd):
+        if os.path.isdir(cwd):
+            return list(argv), cwd
+        log(f"restore: {cwd} no longer exists; using {HOME}")
+        return [HOME if a == cwd else (a[:-len(cwd)] + HOME if a.endswith("=" + cwd) else a) for a in argv], HOME
+
+    def run_terminal(self, it, ws):
+        cls, w0 = it["class"], it["windows"][0]
+        tabs = [dict(t) for t in (it.get("tabs") or
+                [{"cwd": it.get("cwd") or HOME, "resume": it.get("resume"), "atuin": "", "argv": it["argv"]}])]
+        for t in tabs:
+            t["argv"], t["cwd"] = self.fix_cwd(t["argv"], t["cwd"])
+        use_hook = self.hooked and bool(it.get("plain_argv"))
+        as_tabs = use_hook and it.get("term") == "ghostty" and len(tabs) > 1
+        groups = [tabs] if as_tabs else [[t] for t in tabs]
+        for gi, group in enumerate(groups):
+            q = None
+            if use_hook:
+                q = make_queue(group)
+                orig, g0 = it.get("cwd") or HOME, group[0]["cwd"]
+                plain = [g0 if a == orig else (a[:-len(orig)] + g0 if a.endswith("=" + orig) else a)
+                         for a in it["plain_argv"]]
+                argv = ["env", f"OMARCHY_SR_QUEUE={q}", f"OMARCHY_SR_BIN={SELF}"] + plain
+            else:
+                argv = group[0]["argv"]
+            try:
+                if not self.launch(argv, ws):
+                    self.failed.append(cls)
+                    continue
+                c = self.wait_new(cls, self.cfg["terminal_wait_seconds"])
+                if not c:
+                    log(f"restore: no window appeared for {cls} within {self.cfg['terminal_wait_seconds']}s")
+                    self.failed.append(cls)
+                    continue
+                self.place(c, w0 if gi == 0 else dict(w0, fullscreen=0))
+                if q:
+                    if not wait_claims(q, 1, self.cfg["terminal_wait_seconds"]):
+                        log(f"restore: {cls}: the shell did not pick up its saved state (hook not loaded?)")
+                    elif len(group) > 1:
+                        self.ghostty_tabs(c, q, len(group))
+            finally:
+                if q:
+                    try:
+                        os.unlink(q)
+                    except OSError:
+                        pass
+
+    def ghostty_tabs(self, c, q, n):
+        """Open n-1 more tabs in a freshly launched (standalone) Ghostty window.
+        Ghostty has no CLI for tabs, but each window exports GTK actions on
+        D-Bus (win.new-tab); they only act on the focused window, so the window
+        is focused briefly and focus is handed back at the end of the restore."""
+        name = dbus_name_for_pid(c["pid"])
+        path = ghostty_window_path(name) if name else None
+        addr = lua_long("address:" + c["address"])
+        dispatch(f"hl.dsp.focus({{ window = {addr} }})")
+        self.refocus = True
+        time.sleep(0.3)
+        for i in range(1, n):
+            ok = False
+            if name and path:
+                rc, _ = run(["gdbus", "call", "--session", "--dest", name, "--object-path", path,
+                             "--method", "org.gtk.Actions.Activate", "new-tab", "[]", "{}"])
+                ok = rc == 0
+            if not ok:   # fall back to Ghostty's default new_tab keybind
+                dispatch(f"hl.dsp.send_shortcut({{ mods = 'CTRL SHIFT', key = 'T', window = {addr} }})")
+            if not wait_claims(q, i + 1, 8):
+                log(f"restore: ghostty tab {i + 1}/{n} did not start; remaining tabs skipped")
+                self.failed.append(f"{c.get('class')} tab {i + 1}")
+                break
+
+
+def restore(args):
+    cfg = load_config()
+    ensure_dirs()
+    with open_lock(RESTORE_LOCK) as lk:
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log("restore: another restore is running", echo=True)
+            return 1
+        try:
+            path, sess, reason = pick_session(cfg, args)
+        except (ValueError, OSError) as e:
+            log(f"restore: cannot load session: {e}", echo=True)
+            return 1
+        if sess is None:
+            log(f"restore: {reason}", echo=True)
+            return 0
+        if getattr(args, "workspace", None):
+            sess = filter_session(sess, args.workspace)
+            if not args.file and not args.dry_run:
+                log("restore: --workspace without --file would consume the whole saved session; "
+                    "copy it and use --file", echo=True)
+                return 1
+        if args.dry_run:
+            describe(sess, path)
+            if reason and not args.force:
+                print(f"Automatic restore would be SKIPPED: {reason}.")
+                print("Plan it would otherwise run (dry run, nothing launched):")
+            else:
+                print("Restore plan (dry run, nothing launched):")
+            print_plan(sess)
+            return 0
+        if reason and not args.force:
+            log(f"restore: skipped — {reason}", echo=True)
+            if reason.startswith("session is stale"):
+                notify(cfg, "Session not restored", reason)
+                try:
+                    os.replace(path, os.path.join(RESTORED_DIR, "stale-" + time.strftime("%Y%m%d-%H%M%S") + ".json"))
+                except OSError:
+                    pass
+            return 0
+        sha = sha_of(path)
+        # consume the session BEFORE launching anything: it can never run twice
+        if not args.file:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            os.replace(path, os.path.join(RESTORED_DIR, f"session-{stamp}.json"))
+            if os.path.exists(PREV):
+                os.replace(PREV, os.path.join(RESTORED_DIR, f"session-{stamp}.prev.json"))
+        if not args.file:
+            atomic_write(LAST_RESTORE, json.dumps({"sha": sha, "instance": instance_sig(), "at": time.time(),
+                                                   "source": path, "saved_at": sess.get("saved_at")}) + "\n")
+        for f in sorted(glob.glob(os.path.join(RESTORED_DIR, "*.json")))[:-20]:
+            os.unlink(f)
+        log(f"restore: starting ({windows_count(sess)} windows from {path})", echo=True)
+        placed, failed = Restorer(cfg).run(sess)
+        log(f"restore: done, {placed} windows placed; problems: {failed or 'none'}", echo=True)
+        notify(cfg, f"Restored {placed} of {windows_count(sess)} windows",
+               ("Could not restore: " + ", ".join(failed)) if failed else "")
+        return 0
+
+
+# ----------------------------------------------------------------- daemon --
+def set_pdeathsig():
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(1, signal.SIGTERM, 0, 0, 0)  # PR_SET_PDEATHSIG
+    except OSError:
+        pass
+
+
+def socket2_path():
+    rt = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    return os.path.join(rt, "hypr", instance_sig(), ".socket2.sock")
+
+
+def daemon(args):
+    set_pdeathsig()
+    signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+    ensure_dirs()
+    lk = open_lock(DAEMON_LOCK)
+    for _ in range(30):  # a reloading plugin's old daemon may still be exiting
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            time.sleep(0.5)
+    else:
+        log("daemon: another daemon holds the lock; exiting")
+        return 75
+    lk.seek(0)
+    lk.truncate()
+    lk.write(str(os.getpid()))
+    lk.flush()
+    log(f"daemon: started (pid {os.getpid()}, v{VERSION})")
+    cfg = load_config()
+    if cfg["enabled"]:
+        try:
+            restore(argparse.Namespace(dry_run=False, force=False, file=None, prev=False, workspace=None))
+        except Exception as e:
+            log(f"daemon: restore failed: {e!r}")
+    grace_until = time.time() + 30   # let restored windows settle before saving
+    sock, buf = None, b""
+    next_periodic = time.time() + 5
+    pending_at = None
+    first_event = None
+    retry_sock = 0
+    while True:
+        cfg = load_config()
+        if not cfg["enabled"]:
+            if sock:
+                sock.close()
+                sock = None
+            time.sleep(30)
+            continue
+        now = time.time()
+        if sock is None and now >= retry_sock:
+            try:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.connect(socket2_path())
+            except OSError as e:
+                log(f"daemon: cannot connect to Hyprland event socket: {e}")
+                sock, retry_sock = None, now + 30
+        deadline = min(next_periodic, pending_at or next_periodic)
+        timeout = max(0.1, deadline - now)
+        if sock:
+            r, _, _ = select.select([sock], [], [], timeout)
+            if r:
+                data = sock.recv(65536)
+                if not data:
+                    sock.close()
+                    sock, retry_sock = None, time.time() + 5
+                    continue
+                buf += data
+                *lines, buf = buf.split(b"\n")
+                for ln in lines:
+                    ev = ln.split(b">>", 1)[0].decode(errors="replace")
+                    if ev in STRUCTURAL_EVENTS and ev not in TITLE_EVENTS:
+                        t = time.time()
+                        first_event = first_event or t
+                        pending_at = min(t + cfg["event_debounce_seconds"], first_event + 15)
+        else:
+            time.sleep(timeout)
+        now = time.time()
+        due = (pending_at and now >= pending_at) or now >= next_periodic
+        if due:
+            reason = "event" if (pending_at and now >= pending_at) else "timer"
+            pending_at = first_event = None
+            next_periodic = now + max(15, cfg["save_interval_seconds"])
+            if now < grace_until:
+                continue
+            try:
+                save(reason=reason)
+            except Exception as e:
+                log(f"daemon: save failed: {e!r}")
+
+
+def status(args):
+    cfg = load_config()
+    print(f"omarchy-session v{VERSION} — {'ENABLED' if cfg['enabled'] else 'DISABLED'} (config: {CONFIG})")
+    pid = None
+    try:
+        with open(DAEMON_LOCK) as f:
+            pid = int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        pass
+    alive = pid and os.path.exists(f"/proc/{pid}") and "omarchy-session" in " ".join(cmdline(pid))
+    print(f"daemon: {'running, pid ' + str(pid) if alive else 'not running'}")
+    for label, p in (("session", SESSION), ("previous", PREV)):
+        if os.path.exists(p):
+            st = os.stat(p)
+            try:
+                n = windows_count(load_session(p))
+            except Exception as e:
+                n = f"unreadable ({e})"
+            print(f"{label}: {p} — {n} windows, confirmed {fmt_age(time.time() - st.st_mtime)} ago, mode {oct(st.st_mode & 0o777)}")
+        else:
+            print(f"{label}: none")
+    try:
+        with open(LAST_RESTORE) as f:
+            lr = json.load(f)
+        print(f"last restore: {time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(lr['at']))}")
+    except (OSError, ValueError, KeyError):
+        print("last restore: never")
+    print(f"shell hook: {'installed' if hook_installed() else 'not installed (run: omarchy-session install-hook)'}"
+          f" — {HOOK_FILE}")
+    print(f"log: {LOG}")
+    return 0
+
+
+def main():
+    global QUIET
+    ap = argparse.ArgumentParser(prog="omarchy-session", description="Save and restore Hyprland windows (Omarchy plugin eric.session-restore)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("save", help="save the current windows now")
+    s.add_argument("--final", action="store_true", help="also save an empty desktop and freeze autosave for 2 minutes (used before reboot/shutdown)")
+    s.add_argument("--quiet", action="store_true")
+    r = sub.add_parser("restore", help="restore the saved session")
+    r.add_argument("--dry-run", "--print", action="store_true", dest="dry_run", help="show what would be launched; launch nothing")
+    r.add_argument("--force", action="store_true", help="ignore the same-session/stale/already-restored/login-age checks")
+    g = r.add_mutually_exclusive_group()
+    g.add_argument("--file", help="restore from this session file (it is not consumed)")
+    g.add_argument("--prev", action="store_true", help="use the previous good copy (session.prev.json)")
+    r.add_argument("--workspace", "-w", action="append", metavar="N",
+                   help="only restore windows saved on this workspace (repeatable; needs --file or --dry-run)")
+    sub.add_parser("install-hook", help="add the per-terminal hook (Atuin session, tabs, resume) to ~/.bashrc / ~/.zshrc")
+    sub.add_parser("uninstall-hook", help="remove that line again")
+    ct = sub.add_parser("claim-tab", help="(used by the shell hook)")
+    ct.add_argument("queue")
+    sub.add_parser("status", help="show state")
+    sub.add_parser("enable", help="turn saving and auto-restore on")
+    sub.add_parser("disable", help="turn saving and auto-restore off (the plugin stays installed)")
+    sub.add_parser("daemon", help="(run by the plugin service) restore once, then autosave")
+    a = ap.parse_args()
+    if a.cmd == "save":
+        QUIET = a.quiet
+        return save(final=a.final)
+    if a.cmd == "restore":
+        return restore(a)
+    if a.cmd == "status":
+        return status(a)
+    if a.cmd == "claim-tab":
+        return claim_tab(a.queue)
+    if a.cmd == "install-hook":
+        return install_hook(a)
+    if a.cmd == "uninstall-hook":
+        return uninstall_hook(a)
+    if a.cmd in ("enable", "disable"):
+        write_config_key("enabled", a.cmd == "enable")
+        print(f"session restore {a.cmd}d")
+        return 0
+    if a.cmd == "daemon":
+        QUIET = True
+        return daemon(a)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
