@@ -39,7 +39,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 FORMAT = 1
 HOME = os.path.expanduser("~")
 XDG_STATE = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state")
@@ -55,6 +55,9 @@ LOG = os.path.join(STATE_DIR, "session-restore.log")
 DAEMON_LOCK = os.path.join(STATE_DIR, "daemon.lock")
 SAVE_LOCK = os.path.join(STATE_DIR, "save.lock")
 RESTORE_LOCK = os.path.join(STATE_DIR, "restore.lock")
+LAYOUTS_DIR = os.path.join(STATE_DIR, "layouts")
+LAYOUTS_INDEX = os.path.join(LAYOUTS_DIR, "index.json")
+CURRENT_FP_FILE = os.path.join(STATE_DIR, "current-display.json")
 CONFIG = os.path.join(XDG_CONFIG, "omarchy", "session-restore.json")
 RUNTIME_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "omarchy-session-restore")
 SELF = os.path.realpath(__file__)
@@ -78,6 +81,9 @@ DEFAULTS = {
                         "lazydocker", "yazi", "ranger", "nnn", "lf", "mc"],
     "notify": True,
     "resume_agents": True,         # restart coding agents (claude, codex, grok, ...) on restore
+    "per_display": True,           # separate layout per display configuration (docked vs undocked)
+    "restore_special": True,       # also save/restore windows on special/scratchpad workspaces
+    "monitor_settle_seconds": 3,   # wait after monitor hotplug before switching layouts
 }
 
 # --------------------------------------------------------------------------
@@ -156,6 +162,7 @@ STRUCTURAL_EVENTS = {"openwindow", "closewindow", "movewindow", "movewindowv2",
                      "changefloatingmode", "fullscreen", "pin", "moveworkspace",
                      "moveworkspacev2", "renameworkspace", "windowtitlev2"}
 TITLE_EVENTS = {"windowtitlev2"}
+MONITOR_EVENTS = {"monitoradded", "monitorremoved", "monitoraddedv2", "monitorremovedv2"}
 
 QUIET = False
 
@@ -166,7 +173,7 @@ def open_lock(path):
 
 
 def ensure_dirs():
-    for d in (STATE_DIR, RESTORED_DIR):
+    for d in (STATE_DIR, RESTORED_DIR, LAYOUTS_DIR):
         os.makedirs(d, mode=0o700, exist_ok=True)
         try:
             os.chmod(d, 0o700)
@@ -305,6 +312,10 @@ def dispatch(lua):
 
 def ws_selector(w):
     wid, name = w.get("workspace"), w.get("ws_name") or ""
+    # Special/scratchpad workspaces have negative ids; Hyprland wants the name
+    # (special:scratchpad), not name:special:scratchpad or the negative id.
+    if isinstance(wid, int) and wid < 0 and name.startswith("special"):
+        return name
     if isinstance(wid, int) and wid > 0 and (not name or name == str(wid)):
         return str(wid)
     if name:
@@ -327,6 +338,244 @@ def boot_id():
             return f.read().strip()
     except OSError:
         return ""
+
+
+# ------------------------------------------------ display fingerprint --
+def monitor_identity(m):
+    """Stable physical-monitor id. Matches Omarchy's monitor-workspaces.lua:
+    make/model/serial via description, not the connector (HDMI-A-1) which a
+    dock can rename between plugs."""
+    desc = (m.get("description") or "").strip()
+    if desc:
+        return desc
+    parts = [p for p in (m.get("make"), m.get("model"), m.get("serial")) if p]
+    if parts:
+        return " ".join(parts)
+    return m.get("name") or f"monitor-{m.get('id', '?')}"
+
+
+def monitor_meta(m):
+    return {
+        "id": m.get("id"),
+        "name": m.get("name"),
+        "identity": monitor_identity(m),
+        "make": m.get("make") or "",
+        "model": m.get("model") or "",
+        "serial": m.get("serial") or "",
+        "description": m.get("description") or "",
+        "width": m.get("width"),
+        "height": m.get("height"),
+        "x": m.get("x"),
+        "y": m.get("y"),
+        "scale": m.get("scale"),
+        "refreshRate": m.get("refreshRate"),
+    }
+
+
+def display_fingerprint(monitors=None):
+    """Fingerprint for the current set of connected displays.
+
+    Sorted by relative position then identity so the same physical setup
+    yields the same key regardless of Hyprland monitor id assignment.
+    Geometry (resolution, scale, position) is part of the key so a docked
+    ultrawide and the same panel at a different resolution stay distinct."""
+    if monitors is None:
+        monitors = hypr_json("monitors")
+    metas = [monitor_meta(m) for m in monitors if not m.get("disabled")]
+    metas.sort(key=lambda m: (m.get("x") or 0, m.get("y") or 0, m["identity"], m.get("name") or ""))
+    parts = []
+    for m in metas:
+        sc = m.get("scale") or 1
+        try:
+            sc = float(sc)
+        except (TypeError, ValueError):
+            sc = 1.0
+        parts.append(f"{m['identity']}@{m['width']}x{m['height']}+{m['x']}+{m['y']}s{sc:g}")
+    fp = "|".join(parts) or "no-monitors"
+    h = hashlib.sha1(fp.encode()).hexdigest()[:16]
+    if len(metas) == 1:
+        m0 = metas[0]
+        label = f"{m0['identity']} {m0['width']}×{m0['height']}"
+    else:
+        label = " + ".join(f"{m['identity'].split()[-1] if m['identity'] else m['name']} {m['width']}×{m['height']}"
+                           for m in metas)
+    return {"fingerprint": fp, "hash": h, "label": label, "monitors": metas}
+
+
+def layout_session_path(fp_hash):
+    return os.path.join(LAYOUTS_DIR, fp_hash, "session.json")
+
+
+def load_layouts_index():
+    try:
+        with open(LAYOUTS_INDEX) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"by_fp": {}, "current_fp": ""}
+
+
+def save_layouts_index(index):
+    ensure_dirs()
+    atomic_write(LAYOUTS_INDEX, json.dumps(index, indent=2) + "\n", 0o600)
+
+
+def remember_current_display(display):
+    ensure_dirs()
+    atomic_write(CURRENT_FP_FILE, json.dumps({
+        "fingerprint": display["fingerprint"],
+        "hash": display["hash"],
+        "label": display["label"],
+        "at": time.time(),
+    }) + "\n", 0o600)
+
+
+def read_current_display():
+    try:
+        with open(CURRENT_FP_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_layout_copy(sess, display):
+    """Persist this session under its display fingerprint (never consumed on restore)."""
+    ensure_dirs()
+    d = os.path.join(LAYOUTS_DIR, display["hash"])
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    atomic_write(layout_session_path(display["hash"]), json.dumps(sess, indent=1) + "\n", 0o600)
+    index = load_layouts_index()
+    index.setdefault("by_fp", {})[display["fingerprint"]] = {
+        "hash": display["hash"],
+        "label": display["label"],
+        "saved_at": sess.get("saved_at"),
+        "windows": windows_count(sess),
+        "monitors": display["monitors"],
+    }
+    index["current_fp"] = display["fingerprint"]
+    save_layouts_index(index)
+    remember_current_display(display)
+
+
+def identities_of(display_or_monitors):
+    if isinstance(display_or_monitors, dict) and "monitors" in display_or_monitors:
+        mons = display_or_monitors["monitors"]
+    else:
+        mons = display_or_monitors
+    return tuple(sorted((m.get("identity") or monitor_identity(m)) for m in mons))
+
+
+def pick_layout_path(monitors=None, prefer_exact=True):
+    """Best saved layout path for the current (or given) display configuration.
+
+    Exact fingerprint match → same monitor identities (any geometry) → most
+    recently saved layout. Returns (path, match_kind) or (None, reason)."""
+    display = display_fingerprint(monitors)
+    exact = layout_session_path(display["hash"])
+    if prefer_exact and os.path.exists(exact):
+        return exact, "exact"
+    index = load_layouts_index()
+    by_fp = index.get("by_fp") or {}
+    want = set(identities_of(display))
+    candidates = []
+    for fp, meta in by_fp.items():
+        path = layout_session_path(meta.get("hash") or "")
+        if not path or not os.path.exists(path):
+            continue
+        ids = set(identities_of(meta.get("monitors") or []))
+        if ids == want and ids:
+            kind, score = "same-identities", 3
+        elif want and ids and (want & ids):
+            kind, score = "overlap", 2
+        else:
+            kind, score = "other", 1
+        candidates.append((score, meta.get("saved_at") or 0, kind, path, fp))
+    if not candidates:
+        if os.path.exists(SESSION):
+            return SESSION, "legacy-session"
+        return None, "no-layouts"
+    candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    score, _, kind, path, _ = candidates[0]
+    if score >= 2:
+        return path, kind
+    return path, "fallback"
+
+
+def clamp_floating(w, monitors_now, monitors_saved):
+    """If a floating window's saved position is off-screen now, move it onto the
+    primary (or matching-identity) monitor instead of forcing a bad coordinate."""
+    if not w.get("floating") or not w.get("at") or not w.get("size"):
+        return w
+    at, size = list(w["at"]), list(w["size"])
+    if not monitors_now:
+        return w
+    # Prefer a live monitor with the same identity as when saved
+    target = None
+    mid = w.get("monitor_identity")
+    if mid:
+        for m in monitors_now:
+            if monitor_identity(m) == mid or m.get("identity") == mid:
+                target = m
+                break
+    if target is None:
+        # primary = focused, else origin-most
+        target = next((m for m in monitors_now if m.get("focused")), None) or sorted(
+            monitors_now, key=lambda m: (m.get("x") or 0, m.get("y") or 0))[0]
+    mx, my = target.get("x") or 0, target.get("y") or 0
+    mw, mh = int(target.get("width") or 1920), int(target.get("height") or 1080)
+    x, y = int(at[0]), int(at[1])
+    sw, sh = max(50, int(size[0])), max(50, int(size[1]))
+    # Off this monitor (with a small margin)? Snap into it.
+    if x + sw < mx + 8 or y + sh < my + 8 or x > mx + mw - 8 or y > my + mh - 8:
+        x = mx + max(0, (mw - sw) // 4)
+        y = my + max(0, (mh - sh) // 4)
+    sw = min(sw, mw - 16)
+    sh = min(sh, mh - 16)
+    out = dict(w)
+    out["at"] = [x, y]
+    out["size"] = [sw, sh]
+    return out
+
+
+def apply_workspace_layouts(sess):
+    """Apply per-workspace dwindle/scrolling/floating if Omarchy's o.workspace_mode exists.
+
+    Exact dwindle split trees and hyprscrolling column widths are not exposed
+    by Hyprland IPC, so this only restores the layout *mode*."""
+    for ws in sess.get("workspaces") or []:
+        mode = ws.get("tiledLayout") or ws.get("layout")
+        wid = ws.get("id")
+        if not mode or not isinstance(wid, int) or wid <= 0:
+            continue
+        if mode not in ("dwindle", "scrolling", "master", "floating"):
+            continue
+        # Prefer Omarchy helper; fall back to a workspace_rule for tiled modes.
+        rc, out = run(["hyprctl", "eval",
+                       f'o.workspace_mode({{ workspace = "{wid}", mode = "{mode}" }})'])
+        if rc != 0 or "error" in (out or "").lower():
+            if mode != "floating":
+                run(["hyprctl", "eval",
+                     f'hl.workspace_rule({{ workspace = "{wid}", layout = "{mode}" }})'])
+
+
+def move_workspace_to_monitor(ws_id, monitor_name):
+    if not isinstance(ws_id, int) or ws_id <= 0 or not monitor_name:
+        return
+    L = lua_long
+    dispatch(f"hl.dsp.workspace.move({{ workspace = {L(str(ws_id))}, monitor = {L(monitor_name)} }})")
+
+
+def resolve_monitor_name(identity_or_name, monitors_now):
+    if not identity_or_name:
+        return None
+    for m in monitors_now:
+        if m.get("name") == identity_or_name:
+            return m["name"]
+        if monitor_identity(m) == identity_or_name:
+            return m["name"]
+    return None
 
 
 # ------------------------------------------------------------------ /proc --
@@ -1119,14 +1368,18 @@ def window_record(c):
         sid = int(str(c.get("stableId", "0")), 16)
     except ValueError:
         sid = 0
+    grouped = c.get("grouped") or []
     return {
         "title": c.get("title", ""),
         "workspace": ws.get("id"),
         "ws_name": ws.get("name", ""),
         "monitor": c.get("monitor"),
+        "monitor_name": "",
+        "monitor_identity": "",
         "floating": bool(c.get("floating")),
         "fullscreen": int(c.get("fullscreen") or 0),
         "pinned": bool(c.get("pinned")),
+        "grouped": len(grouped) if isinstance(grouped, list) else 0,
         "at": c.get("at"),
         "size": c.get("size"),
         "stable": sid,
@@ -1146,7 +1399,10 @@ def snapshot(cfg):
         ws = (c.get("workspace") or {}).get("id")
         if not c.get("mapped", True) or c.get("hidden"):
             continue
-        if not isinstance(ws, int) or ws <= 0:
+        if not isinstance(ws, int):
+            skipped.append((cls, "no workspace"))
+            continue
+        if ws <= 0 and not cfg.get("restore_special", True):
             skipped.append((cls, "special workspace"))
             continue
         if c.get("pid", 0) <= 0:
@@ -1325,14 +1581,47 @@ def snapshot(cfg):
                           "desktop_id": desk_e["id"] if desk_e else "",
                           "windows": [window_record(c) for c in wins]})
 
+    display = display_fingerprint(monitors)
+    mon_by_id = {m.get("id"): m for m in display["monitors"]}
+    for it in items:
+        for w in it.get("windows") or []:
+            mid = w.get("monitor")
+            meta = mon_by_id.get(mid) if isinstance(mid, int) else None
+            if meta:
+                w["monitor_name"] = meta.get("name") or ""
+                w["monitor_identity"] = meta.get("identity") or ""
+    workspaces = []
+    try:
+        for ws in hypr_json("workspaces"):
+            wid = ws.get("id")
+            if not isinstance(wid, int):
+                continue
+            if wid <= 0 and not cfg.get("restore_special", True):
+                continue
+            mmeta = None
+            for m in display["monitors"]:
+                if m.get("name") == ws.get("monitor") or m.get("id") == ws.get("monitorID"):
+                    mmeta = m
+                    break
+            workspaces.append({
+                "id": wid,
+                "name": ws.get("name", ""),
+                "monitor": ws.get("monitor"),
+                "monitor_identity": (mmeta or {}).get("identity", ""),
+                "tiledLayout": ws.get("tiledLayout") or "",
+                "windows": ws.get("windows") or 0,
+            })
+    except Exception as e:
+        log(f"snapshot: workspaces: {e!r}")
     return {
         "format": FORMAT,
         "version": VERSION,
         "saved_at": time.time(),
         "instance": instance_sig(),
         "boot_id": boot_id(),
-        "monitors": [{"id": m.get("id"), "name": m.get("name"), "width": m.get("width"),
-                      "height": m.get("height")} for m in monitors],
+        "display": display,
+        "monitors": display["monitors"],
+        "workspaces": workspaces,
         "items": items,
         "skipped": [{"class": c, "reason": r} for c, r in skipped],
     }
@@ -1391,13 +1680,24 @@ def save(final=False, reason="manual"):
                 old = json.load(f)
         except (OSError, ValueError):
             pass
-        if old and old.get("items") == sess["items"] and old.get("instance") == sess["instance"]:
+        display = sess.get("display") or display_fingerprint()
+        same = (old and old.get("items") == sess["items"] and old.get("instance") == sess["instance"]
+                and (old.get("display") or {}).get("fingerprint") == display.get("fingerprint"))
+        if same:
             os.utime(SESSION)
             msg = "unchanged"
         else:
             atomic_write(SESSION, json.dumps(sess, indent=1) + "\n", 0o600,
                          keep_prev=PREV if old else None)
             msg = "written"
+        if cfg.get("per_display", True):
+            try:
+                save_layout_copy(sess, display)
+                msg += f"; layout[{display.get('label', display.get('hash'))}]"
+            except Exception as e:
+                log(f"save: layout copy failed: {e!r}")
+        else:
+            remember_current_display(display)
         if final:
             atomic_write(FREEZE, str(time.time() + 120), 0o600)
         log(f"save ({reason}{', final' if final else ''}): {n} windows, {msg}", echo=not QUIET and reason == "manual")
@@ -1622,21 +1922,60 @@ def hypr_uptime():
 
 
 def pick_session(cfg, args):
-    """Return (path, session, reason_to_skip_or_None)."""
+    """Return (path, session, reason_to_skip_or_None, consume).
+
+    consume=False when the path is a per-display layouts/ copy that must survive
+    restore so the next dock/undock can find it again."""
     if args.file:
-        return args.file, load_session(args.file), None
-    path = PREV if args.prev else SESSION
-    if not os.path.exists(path):
-        return None, None, "no saved session"
-    try:
-        sess = load_session(path)
-    except (ValueError, OSError) as e:
-        if path == SESSION and os.path.exists(PREV):
-            log(f"restore: {e}; falling back to {PREV}")
-            path = PREV
-            sess = load_session(PREV)
-        else:
-            raise
+        return args.file, load_session(args.file), None, False
+    if args.prev:
+        if not os.path.exists(PREV):
+            return None, None, "no previous session", True
+        return PREV, load_session(PREV), None, True
+
+    path, sess, consume = None, None, True
+    display = display_fingerprint()
+    match_kind = "legacy-session"
+    if cfg.get("per_display", True):
+        layout_path, match_kind = pick_layout_path(prefer_exact=True)
+        if layout_path and layout_path != SESSION and os.path.exists(layout_path):
+            try:
+                layout_sess = load_session(layout_path)
+            except (ValueError, OSError) as e:
+                log(f"restore: layout {layout_path}: {e}")
+                layout_sess = None
+            if layout_sess is not None:
+                # Prefer the layout when SESSION is missing, for another display
+                # config, or absent entirely. Keep SESSION when it already matches.
+                sess_fp = None
+                if os.path.exists(SESSION):
+                    try:
+                        with open(SESSION) as f:
+                            sess_fp = (json.load(f).get("display") or {}).get("fingerprint")
+                    except (OSError, ValueError):
+                        pass
+                if sess_fp != display["fingerprint"]:
+                    path, sess, consume = layout_path, layout_sess, False
+                    log(f"restore: using per-display layout ({match_kind}) for {display['label']}")
+
+    if sess is None:
+        path = SESSION
+        if not os.path.exists(path):
+            # last resort: any layout
+            layout_path, match_kind = pick_layout_path(prefer_exact=False)
+            if layout_path and os.path.exists(layout_path):
+                path, consume = layout_path, False
+            else:
+                return None, None, "no saved session", True
+        try:
+            sess = load_session(path)
+        except (ValueError, OSError) as e:
+            if path == SESSION and os.path.exists(PREV):
+                log(f"restore: {e}; falling back to {PREV}")
+                path, sess, consume = PREV, load_session(PREV), True
+            else:
+                raise
+
     reason = None
     age = time.time() - os.stat(path).st_mtime
     last = {}
@@ -1657,7 +1996,11 @@ def pick_session(cfg, args):
         up = hypr_uptime()
         if up is not None and up > cfg["max_login_age_seconds"]:
             reason = f"Hyprland has been running {fmt_age(up)}; auto-restore only runs right after login"
-    return path, sess, reason
+    # Annotate how well the saved display matches the live one
+    sess = dict(sess)
+    sess["_display_match"] = match_kind if cfg.get("per_display", True) else "disabled"
+    sess["_live_display"] = display
+    return path, sess, reason, consume
 
 
 def describe(sess, path):
@@ -1666,6 +2009,18 @@ def describe(sess, path):
     print(f"Saved {time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime(sess.get('saved_at', 0)))}"
           f" (last confirmed {fmt_age(age)} ago), Hyprland instance {str(sess.get('instance'))[:12]}…,"
           f" {windows_count(sess)} windows in {len(sess['items'])} launch entries")
+    disp = sess.get("display") or {}
+    live = sess.get("_live_display") or {}
+    if disp:
+        print(f"Saved display: {disp.get('label') or disp.get('fingerprint')}"
+              f" (match={sess.get('_display_match', '?')})")
+    if live and live.get("fingerprint") != disp.get("fingerprint"):
+        print(f"Live display:  {live.get('label') or live.get('fingerprint')}")
+    wss = sess.get("workspaces") or []
+    if wss:
+        modes = ", ".join(f"{w.get('id')}:{w.get('tiledLayout') or '?'}" for w in wss if (w.get('id') or 0) > 0)
+        if modes:
+            print(f"Workspace layouts: {modes}")
 
 
 def ordered_items(sess):
@@ -1737,6 +2092,48 @@ def print_plan(sess):
         print("\nNot saved: " + ", ".join(f"{s['class']} ({s['reason']})" for s in sess["skipped"]))
 
 
+
+def relayout_existing(sess, cfg=None):
+    """Re-place already-open windows to match a saved layout (hotplug path).
+
+    Does not launch apps. Used when the display configuration changes and a
+    remembered layout for the new fingerprint exists."""
+    cfg = cfg or load_config()
+    r = Restorer(cfg)
+    r.sess = sess
+    r.monitors_now = hypr_json("monitors")
+    r.known = set()  # claim any existing window
+    try:
+        apply_workspace_layouts(sess)
+    except Exception as e:
+        log(f"relayout: workspace layouts: {e!r}")
+    live = r.clients()
+    placed = 0
+    for it in sess.get("items") or []:
+        cls = it.get("class") or ""
+        for w in it.get("windows") or []:
+            cands = [c for c in live
+                     if c["address"] not in r.claimed
+                     and (c.get("class") or c.get("initialClass") or "").lower() == cls.lower()]
+            if not cands:
+                continue
+            best = max(cands, key=lambda c: difflib.SequenceMatcher(
+                None, norm_title(c.get("title")), norm_title(w.get("title"))).ratio())
+            score = difflib.SequenceMatcher(
+                None, norm_title(best.get("title")), norm_title(w.get("title"))).ratio()
+            if score < 0.4 and len(cands) > 1:
+                continue
+            r.place(best, w)
+            placed += 1
+    try:
+        r.reorder_tiled(sess)
+    except Exception as e:
+        log(f"relayout: reorder: {e!r}")
+    log(f"relayout: placed {placed} existing windows for "
+        f"{(sess.get('display') or {}).get('label', '?')}")
+    return placed
+
+
 class Restorer:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -1781,6 +2178,19 @@ class Restorer:
         addr = "address:" + c["address"]
         L = lua_long
         self.claimed.add(c["address"])
+        monitors_now = getattr(self, "monitors_now", None) or hypr_json("monitors")
+        w = clamp_floating(w, monitors_now, (getattr(self, "sess", {}) or {}).get("monitors") or [])
+        mid = w.get("monitor_identity") or w.get("monitor_name")
+        mon_name = resolve_monitor_name(mid, monitors_now)
+        wid = w.get("workspace")
+        if mon_name and isinstance(wid, int) and wid > 0:
+            try:
+                for ws in hypr_json("workspaces"):
+                    if ws.get("id") == wid and ws.get("monitor") != mon_name:
+                        move_workspace_to_monitor(wid, mon_name)
+                        break
+            except Exception:
+                pass
         ws = ws_selector(w)
         cur = c.get("workspace") or {}
         if ws_selector({"workspace": cur.get("id"), "ws_name": cur.get("name", "")}) != ws:
@@ -1914,6 +2324,12 @@ class Restorer:
                     break
 
     def run(self, sess):
+        self.sess = sess
+        self.monitors_now = hypr_json("monitors")
+        try:
+            apply_workspace_layouts(sess)
+        except Exception as e:
+            log(f"restore: workspace layouts: {e!r}")
         items = ordered_items(sess)
         for it in items:
             k, cls, wins = it["kind"], it["class"], it["windows"]
@@ -2059,7 +2475,7 @@ def restore(args):
             log("restore: another restore is running", echo=True)
             return 1
         try:
-            path, sess, reason = pick_session(cfg, args)
+            path, sess, reason, consume = pick_session(cfg, args)
         except (ValueError, OSError) as e:
             log(f"restore: cannot load session: {e}", echo=True)
             return 1
@@ -2083,7 +2499,7 @@ def restore(args):
             return 0
         if reason and not args.force:
             log(f"restore: skipped — {reason}", echo=True)
-            if reason.startswith("session is stale"):
+            if reason.startswith("session is stale") and consume and path and os.path.exists(path):
                 notify(cfg, "Session not restored", reason)
                 try:
                     os.replace(path, os.path.join(RESTORED_DIR, "stale-" + time.strftime("%Y%m%d-%H%M%S") + ".json"))
@@ -2091,18 +2507,39 @@ def restore(args):
                     pass
             return 0
         sha = sha_of(path)
-        # consume the session BEFORE launching anything: it can never run twice
-        if not args.file:
+        # Consume SESSION/PREV before launching so a crash cannot restore twice.
+        # Per-display layouts/ copies are never consumed — they are the dock memory.
+        if not args.file and consume:
             stamp = time.strftime("%Y%m%d-%H%M%S")
-            os.replace(path, os.path.join(RESTORED_DIR, f"session-{stamp}.json"))
-            if os.path.exists(PREV):
+            if os.path.exists(path):
+                os.replace(path, os.path.join(RESTORED_DIR, f"session-{stamp}.json"))
+            if path == SESSION and os.path.exists(PREV):
                 os.replace(PREV, os.path.join(RESTORED_DIR, f"session-{stamp}.prev.json"))
+        elif not args.file and not consume:
+            # Still clear the top-level SESSION pointer so login restore won't re-run
+            # the same apps from the legacy path after a layout-based restore.
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            if os.path.exists(SESSION):
+                try:
+                    os.replace(SESSION, os.path.join(RESTORED_DIR, f"session-{stamp}.json"))
+                except OSError:
+                    pass
+            if os.path.exists(PREV):
+                try:
+                    os.replace(PREV, os.path.join(RESTORED_DIR, f"session-{stamp}.prev.json"))
+                except OSError:
+                    pass
         if not args.file:
-            atomic_write(LAST_RESTORE, json.dumps({"sha": sha, "instance": instance_sig(), "at": time.time(),
-                                                   "source": path, "saved_at": sess.get("saved_at")}) + "\n")
+            atomic_write(LAST_RESTORE, json.dumps({
+                "sha": sha, "instance": instance_sig(), "at": time.time(),
+                "source": path, "saved_at": sess.get("saved_at"),
+                "display": (sess.get("display") or {}).get("fingerprint"),
+                "display_match": sess.get("_display_match"),
+            }) + "\n")
         for f in sorted(glob.glob(os.path.join(RESTORED_DIR, "*.json")))[:-20]:
             os.unlink(f)
-        log(f"restore: starting ({windows_count(sess)} windows from {path})", echo=True)
+        log(f"restore: starting ({windows_count(sess)} windows from {path}"
+            f", display_match={sess.get('_display_match')})", echo=True)
         placed, failed = Restorer(cfg).run(sess)
         log(f"restore: done, {placed} windows placed; problems: {failed or 'none'}", echo=True)
         notify(cfg, f"Restored {placed} of {windows_count(sess)} windows",
@@ -2155,6 +2592,12 @@ def daemon(args):
     pending_at = None
     first_event = None
     retry_sock = 0
+    monitor_pending_at = None
+    try:
+        current_fp = display_fingerprint()["fingerprint"]
+        remember_current_display(display_fingerprint())
+    except Exception:
+        current_fp = read_current_display().get("fingerprint") or ""
     while True:
         cfg = load_config()
         if not cfg["enabled"]:
@@ -2171,7 +2614,12 @@ def daemon(args):
             except OSError as e:
                 log(f"daemon: cannot connect to Hyprland event socket: {e}")
                 sock, retry_sock = None, now + 30
-        deadline = min(next_periodic, pending_at or next_periodic)
+        candidates = [next_periodic]
+        if pending_at:
+            candidates.append(pending_at)
+        if monitor_pending_at:
+            candidates.append(monitor_pending_at)
+        deadline = min(candidates)
         timeout = max(0.1, deadline - now)
         if sock:
             r, _, _ = select.select([sock], [], [], timeout)
@@ -2185,13 +2633,48 @@ def daemon(args):
                 *lines, buf = buf.split(b"\n")
                 for ln in lines:
                     ev = ln.split(b">>", 1)[0].decode(errors="replace")
-                    if ev in STRUCTURAL_EVENTS and ev not in TITLE_EVENTS:
+                    if ev in MONITOR_EVENTS:
+                        # Save under the OLD fingerprint first (best-effort), then
+                        # after settle switch to the matching layout for the new one.
+                        monitor_pending_at = time.time() + max(1, int(cfg.get("monitor_settle_seconds", 3)))
+                    elif ev in STRUCTURAL_EVENTS and ev not in TITLE_EVENTS:
                         t = time.time()
                         first_event = first_event or t
                         pending_at = min(t + cfg["event_debounce_seconds"], first_event + 15)
         else:
             time.sleep(timeout)
         now = time.time()
+        if monitor_pending_at and now >= monitor_pending_at:
+            monitor_pending_at = None
+            if cfg.get("per_display", True):
+                try:
+                    # Snapshot current windows under the previous fingerprint if
+                    # Hyprland hasn't already torn the old layout down completely.
+                    if current_fp:
+                        try:
+                            save(reason="pre-hotplug")
+                        except Exception as e:
+                            log(f"daemon: pre-hotplug save: {e!r}")
+                    new_disp = display_fingerprint()
+                    new_fp = new_disp["fingerprint"]
+                    if new_fp != current_fp:
+                        log(f"daemon: display config changed -> {new_disp['label']}")
+                        path, kind = pick_layout_path()
+                        if path and kind in ("exact", "same-identities") and os.path.exists(path):
+                            try:
+                                sess = load_session(path)
+                                n = relayout_existing(sess, cfg)
+                                log(f"daemon: hotplug relayout ({kind}) placed {n}")
+                            except Exception as e:
+                                log(f"daemon: hotplug relayout failed: {e!r}")
+                        else:
+                            log(f"daemon: no saved layout for {new_disp['label']}; "
+                                f"using Hyprland defaults until you arrange windows")
+                        current_fp = new_fp
+                        remember_current_display(new_disp)
+                        grace_until = time.time() + 10
+                except Exception as e:
+                    log(f"daemon: monitor settle failed: {e!r}")
         due = (pending_at and now >= pending_at) or now >= next_periodic
         if due:
             reason = "event" if (pending_at and now >= pending_at) else "timer"
@@ -2201,6 +2684,10 @@ def daemon(args):
                 continue
             try:
                 save(reason=reason)
+                try:
+                    current_fp = display_fingerprint()["fingerprint"]
+                except Exception:
+                    pass
             except Exception as e:
                 log(f"daemon: save failed: {e!r}")
 
@@ -2226,6 +2713,19 @@ def status(args):
             print(f"{label}: {p} — {n} windows, confirmed {fmt_age(time.time() - st.st_mtime)} ago, mode {oct(st.st_mode & 0o777)}")
         else:
             print(f"{label}: none")
+    try:
+        disp = display_fingerprint()
+        print(f"display: {disp['label']}")
+        print(f"  fingerprint: {disp['fingerprint'][:100]}{'…' if len(disp['fingerprint'])>100 else ''}")
+        index = load_layouts_index()
+        layouts = index.get("by_fp") or {}
+        print(f"  saved layouts: {len(layouts)}")
+        for fp, meta in sorted(layouts.items(), key=lambda kv: -(kv[1].get("saved_at") or 0))[:8]:
+            mark = " <<" if fp == disp["fingerprint"] else ""
+            print(f"    - {meta.get('label', fp[:40])}: {meta.get('windows', '?')} windows, "
+                  f"{fmt_age(time.time() - (meta.get('saved_at') or 0))} ago{mark}")
+    except Exception as e:
+        print(f"display: (unavailable: {e})")
     try:
         with open(LAST_RESTORE) as f:
             lr = json.load(f)

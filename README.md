@@ -18,7 +18,49 @@ atomic state, restore-once guarantees and a dry-run mode. See `LICENSE`.
 | **Everything else** | `/proc/<pid>/cmdline`, flatpak cgroup, `$APPIMAGE`, `.desktop` file lookup | relaunched with the same argv (or `flatpak run`, the AppImage, or the desktop `Exec`). Multi-window apps launch once; extra windows are matched by title. |
 
 Floating state, size/position (floating windows), fullscreen/maximized and
-pin are re-applied. Windows on special (scratchpad) workspaces are skipped.
+pin are re-applied. Per-workspace layout mode (dwindle / scrolling / floating)
+is restored when Omarchy's `o.workspace_mode` is available. Windows on special
+(scratchpad) workspaces are saved and restored when `restore_special` is true
+(the default).
+
+### Per-display layouts (docked vs undocked)
+
+Like macOS, a **separate window layout is remembered for each display
+configuration**. The fingerprint is the sorted list of connected monitors
+identified by make/model/serial (Hyprland's `description`, same identity
+Omarchy uses for workspace blocks) plus resolution, scale and relative
+position — not the connector name (`HDMI-A-1`), which a dock can rename.
+
+Layouts live under `~/.local/state/omarchy/session-restore/layouts/<hash>/`
+and are never consumed on restore, so docking again can find them. On
+monitor hotplug the daemon waits `monitor_settle_seconds` (default 3),
+saves the previous layout, then re-places already-open windows to match
+the layout for the new fingerprint when one exists. A brand-new display
+config gets Hyprland's defaults until you arrange windows and a save
+runs.
+
+### Hyprland / Omarchy coverage
+
+| Feature | Support | Notes |
+|---|---|---|
+| App launch + workspace | **full** | terminals (cwd/Atuin/tabs/agents), browsers (per Chrome profile), web apps, other apps |
+| Floating / tiled | **full** | floating flag toggled on restore |
+| Floating size + position | **full** | clamped onto a live monitor if the saved display is gone |
+| Fullscreen / maximized | **full** | |
+| Pin (show on all workspaces) | **full** | Hyprland pin; not macOS-style edge snap (Hyprland has no edge-pin) |
+| Monitor placement | **full** | workspace moved onto the matching physical monitor by identity |
+| Per-display layouts | **full** | fingerprint-keyed; hotplug settle + relayout |
+| Workspace layout mode | **partial** | dwindle / scrolling / floating via `o.workspace_mode`; exact dwindle split tree **not** exposed by Hyprland |
+| Scrolling column widths | **unsupported** | hyprscrolling options are global; per-column widths not in IPC |
+| Special / scratchpad | **partial** | saved/restored by name (`special:scratchpad`); may interact with Omarchy qconsole |
+| Window groups | **unsupported** | `grouped` count is recorded; group membership is not rebuilt |
+| Workspace groups / binds | **n/a** | Omarchy owns per-monitor workspace blocks (`monitor-workspaces`); we don't override them |
+
+There is **no** native Hyprland “layout dump” file. Everything goes through
+`hyprctl -j` (clients / workspaces / monitors) plus Omarchy's own state under
+`~/.local/state/omarchy/workspace-layouts` (SUPER+L toggle) and
+`monitor-workspaces`. This plugin reads Hyprland IPC and writes its own
+session JSON.
 
 ## Terminals: Atuin sessions, tabs and coding agents
 
@@ -147,6 +189,18 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
   "resume_agents": true
 }
 ```
+
+
+## Configuration
+
+Optional keys in `~/.config/omarchy/session-restore.json`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `per_display` | `true` | Remember a separate layout per display fingerprint (docked vs undocked) |
+| `restore_special` | `true` | Save/restore windows on special/scratchpad workspaces |
+| `monitor_settle_seconds` | `3` | Delay after monitor hotplug before switching layouts |
+
 
 ## Install / remove
 
