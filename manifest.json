@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "eric.session-restore",
   "name": "Session Restore",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "Eric Westphal (based on wbarakat/omarchy-session-restore by Waleed)",
   "description": "Saves your open windows (terminals with their folders, browsers, web apps and other apps) and puts them back on the same workspaces after a reboot.",
   "kinds": ["service"],

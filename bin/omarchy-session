@@ -39,7 +39,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 FORMAT = 1
 HOME = os.path.expanduser("~")
 XDG_STATE = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state")
@@ -133,6 +133,22 @@ BROWSER_BINS = {
 WEBAPP_CLASS = re.compile(
     r"^(chrome|google-chrome|chromium|brave|brave-browser|msedge|microsoft-edge|vivaldi|"
     r"helium|opera|thorium|cromite)-(?P<app>.+)-(?P<profile>Default|Profile_\d+|Guest_Profile)$")
+# Chromium-family user-data dirs under $XDG_CONFIG_HOME (basename of the browser binary → dir).
+CHROMIUM_USER_DATA = {
+    "chrome": "google-chrome", "google-chrome": "google-chrome",
+    "google-chrome-stable": "google-chrome", "google-chrome-beta": "google-chrome-beta",
+    "google-chrome-unstable": "google-chrome-unstable",
+    "chromium": "chromium", "chromium-browser": "chromium",
+    "ungoogled-chromium": "chromium", "cromite": "cromite", "supermium": "supermium",
+    "brave": "BraveSoftware/Brave-Browser", "brave-browser": "BraveSoftware/Brave-Browser",
+    "brave-browser-stable": "BraveSoftware/Brave-Browser",
+    "msedge": "microsoft-edge", "microsoft-edge": "microsoft-edge",
+    "microsoft-edge-stable": "microsoft-edge",
+    "vivaldi": "vivaldi", "vivaldi-bin": "vivaldi", "vivaldi-stable": "vivaldi",
+    "opera": "opera", "helium": "helium", "helium-browser": "helium",
+    "thorium": "thorium", "thorium-browser": "thorium",
+}
+PROFILE_DIR_RE = re.compile(r"^(Default|Guest Profile|System Profile|Profile \d+)$")
 SHELLS = {"bash", "zsh", "fish", "sh", "dash", "ksh", "mksh", "tcsh", "csh", "nu",
           "elvish", "xonsh", "oil", "osh", "ysh", "ion", "pwsh"}
 FIELD_CODES = {"%f", "%F", "%u", "%U", "%d", "%D", "%n", "%N", "%i", "%c", "%k", "%v", "%m"}
@@ -960,6 +976,143 @@ def terminal_launch(term_key, spec, base_argv, cwd, resume, default_ids, desk_en
     return argv
 
 
+def norm_title(t):
+    t = re.sub(r"^\(\d[\d,]*\)\s*", "", t or "")
+    t = re.sub(r"\s+[-—–]\s+(Google Chrome|Chromium|Brave|Microsoft\s*Edge|Vivaldi|"
+               r"Mozilla Firefox|Firefox|LibreWolf|Zen Browser|Helium)$", "", t)
+    return t.strip().lower()
+
+
+def chromium_user_data(pbase, pexe, pargv):
+    """Absolute Chromium user-data dir for this browser process, or None."""
+    for a in pargv or []:
+        if a.startswith("--user-data-dir="):
+            d = os.path.expanduser(a.split("=", 1)[1])
+            return d if os.path.isdir(d) else None
+    for name in (pbase, base(pexe)):
+        rel = CHROMIUM_USER_DATA.get(name)
+        if rel:
+            d = os.path.join(XDG_CONFIG, rel)
+            return d if os.path.isdir(d) else None
+    return None
+
+
+def chromium_profile_dirs(user_data):
+    """Ordered list of profile directory names from Local State (validated)."""
+    try:
+        with open(os.path.join(user_data, "Local State")) as f:
+            ls = json.load(f)
+    except (OSError, ValueError):
+        return []
+    prof = ls.get("profile") or {}
+    order = list(prof.get("profiles_order") or [])
+    info = prof.get("info_cache") or {}
+    names = order or list(info.keys())
+    out = []
+    for n in names:
+        if PROFILE_DIR_RE.fullmatch(n) and os.path.isdir(os.path.join(user_data, n)):
+            out.append(n)
+    return out
+
+
+def chromium_profile_emails(user_data):
+    """profile_dir → signed-in email (may be empty). Never returns tokens."""
+    try:
+        with open(os.path.join(user_data, "Local State")) as f:
+            info = (json.load(f).get("profile") or {}).get("info_cache") or {}
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for n, p in info.items():
+        if not PROFILE_DIR_RE.fullmatch(n) or not isinstance(p, dict):
+            continue
+        email = str(p.get("user_name") or "").strip()
+        out[n] = email
+    return out
+
+
+def _chromium_session_titles(user_data, profile):
+    """Title-like strings from the newest Session_*/Tabs_* files (UTF-8 and UTF-16LE)."""
+    sd = os.path.join(user_data, profile, "Sessions")
+    if not os.path.isdir(sd):
+        return []
+    files = sorted(
+        (os.path.join(sd, f) for f in os.listdir(sd)
+         if f.startswith("Session_") or f.startswith("Tabs_")),
+        key=lambda p: os.path.getmtime(p), reverse=True)
+    titles = set()
+    for path in files[:4]:
+        try:
+            if os.path.getsize(path) > 8_000_000:
+                continue
+            data = open(path, "rb").read()
+        except OSError:
+            continue
+        for m in re.finditer(rb"[ -~]{4,180}", data):
+            titles.add(m.group().decode())
+        for m in re.finditer(rb"(?:[\x20-\x7e]\x00){4,120}", data):
+            try:
+                titles.add(m.group().decode("utf-16-le"))
+            except UnicodeDecodeError:
+                pass
+    return list(titles)
+
+
+def match_chromium_profile(title, user_data, emails=None, title_cache=None):
+    """Which profile directory owns this window title, or None."""
+    if not title or not user_data:
+        return None
+    emails = emails if emails is not None else chromium_profile_emails(user_data)
+    low = title.lower()
+    for prof, email in emails.items():
+        if email and email.lower() in low:
+            return prof
+    # Fall back to titles embedded in each profile's session/tabs files.
+    # Score by the longest solid match so short tokens like "2026" or "YouTube"
+    # can't tie two profiles at 1.0.
+    if title_cache is None:
+        title_cache = {}
+    nt = norm_title(title)
+    if not nt or len(nt) < 3:
+        return None
+    best, best_score, second = None, 0.0, 0.0
+    for prof in chromium_profile_dirs(user_data):
+        if prof not in title_cache:
+            title_cache[prof] = _chromium_session_titles(user_data, prof)
+        score = 0.0
+        for st in title_cache[prof]:
+            ns = norm_title(st)
+            if not ns or len(ns) < 5:
+                continue
+            if nt == ns:
+                score = max(score, 1000 + len(ns))
+            elif ns in nt:
+                # session string is a tab title contained in the window title
+                score = max(score, 500 + len(ns))
+            elif nt in ns:
+                score = max(score, 400 + len(nt))
+            else:
+                r = difflib.SequenceMatcher(None, nt, ns).ratio()
+                if r >= 0.85:
+                    score = max(score, int(r * 300) + min(len(ns), len(nt)))
+        if score > best_score:
+            second, best_score, best = best_score, score, prof
+        elif score > second:
+            second = score
+    if best and best_score >= 405 and best_score > second:
+        return best
+    return None
+
+
+def with_profile_directory(argv, profile):
+    """Return argv with --profile-directory set (and any prior value removed)."""
+    if not profile or not PROFILE_DIR_RE.fullmatch(profile):
+        return list(argv)
+    out = [a for a in argv if not a.startswith("--profile-directory")]
+    out.append("--profile-directory=" + profile)
+    return out
+
+
 def window_record(c):
     ws = c.get("workspace") or {}
     try:
@@ -1053,13 +1206,34 @@ def snapshot(cfg):
                 else:
                     argv = [a for a in pargv if "://" not in a and not a.startswith(("--app=", "--app-id="))]
                     strategy = "process cmdline"
-                key = (cls, tuple(argv))
-                if key not in browsers:
-                    browsers[key] = {"kind": "browser", "class": cls, "argv": argv,
-                                     "strategy": strategy + "; browser reopens its own windows, matched by title",
-                                     "windows": []}
-                    items.append(browsers[key])
-                browsers[key]["windows"] += [window_record(c) for c in wins]
+                # Strip a stale --profile-directory from the process cmdline; we set it per group.
+                argv = [a for a in argv if not a.startswith("--profile-directory")]
+                ud = chromium_user_data(pbase, base(pexe), pargv)
+                emails = chromium_profile_emails(ud) if ud else {}
+                title_cache = {}
+                by_prof = {}
+                for c in wins:
+                    wr = window_record(c)
+                    prof = None
+                    # Prefer an explicit --profile-directory= on a per-window helper if present
+                    # (rare on Linux; multi-profile usually shares one browser process).
+                    if ud:
+                        prof = match_chromium_profile(wr["title"], ud, emails, title_cache)
+                    by_prof.setdefault(prof, []).append(wr)
+                for prof, pwins in by_prof.items():
+                    pargv2 = with_profile_directory(argv, prof) if prof else list(argv)
+                    key = (cls, tuple(pargv2))
+                    if key not in browsers:
+                        label = f", profile {prof}" if prof else ""
+                        browsers[key] = {
+                            "kind": "browser", "class": cls, "argv": pargv2,
+                            "profile": prof or "",
+                            "strategy": (strategy + label +
+                                         "; browser reopens this profile's windows, matched by title"),
+                            "windows": [],
+                        }
+                        items.append(browsers[key])
+                    browsers[key]["windows"] += pwins
                 continue
 
             # ---- terminal
@@ -1524,11 +1698,13 @@ def print_plan(sess):
         k = it["kind"]
         if k == "browser":
             ws = primary_ws(it)
-            print(f"\n{n}. browser [{it['class']}] — launch once on workspace {ws}, "
+            prof = it.get("profile") or ""
+            who = f"profile {prof}" if prof else "default profile"
+            print(f"\n{n}. browser [{it['class']}] — launch {who} on workspace {ws}, "
                   f"then place {len(it['windows'])} reopened windows by title ({it['strategy']}):")
             for w in it["windows"]:
                 print(f"     ws {ws_selector(w):>3}  {'floating ' if w['floating'] else ''}\"{w['title'][:70]}\"")
-            print("     (skipped if a window of this browser already exists)")
+            print("     (skipped only if this profile's windows are already open)")
         else:
             w = it["windows"][0]
             extra = ""
@@ -1559,12 +1735,6 @@ def print_plan(sess):
         print("     dispatch: " + exec_dispatch_string(it["argv"], primary_ws(it) if k == "browser" else ws_selector(it["windows"][0]), use_uwsm))
     if sess.get("skipped"):
         print("\nNot saved: " + ", ".join(f"{s['class']} ({s['reason']})" for s in sess["skipped"]))
-
-
-def norm_title(t):
-    t = re.sub(r"^\(\d[\d,]*\)\s*", "", t or "")
-    t = re.sub(r"\s+[-—–]\s+(Google Chrome|Chromium|Brave|Microsoft​? Edge|Vivaldi|Mozilla Firefox|Firefox|LibreWolf|Zen Browser|Helium)$", "", t)
-    return t.strip().lower()
 
 
 class Restorer:
@@ -1651,6 +1821,7 @@ class Restorer:
                         continue
                     if score >= 0.8 or (done and score >= 0.4) or (done and len(remaining) == 1 and len(cands) == 1):
                         self.place(cands[ci], remaining[wi])
+                        g.setdefault("placed", []).append((cands[ci]["address"], remaining[wi]))
                         used_c.add(ci)
                         used_w.add(wi)
                 g["remaining"] = [w for wi, w in enumerate(remaining) if wi not in used_w]
@@ -1662,19 +1833,109 @@ class Restorer:
                     self.failed += [f"{g['class']}: \"{w['title'][:40]}\"" for w in g["remaining"]]
                 self.pending.remove(g)
 
+    @staticmethod
+    def _titles_covered(clients, wins):
+        """True when every saved window title fuzzy-matches some live client."""
+        if not wins:
+            return True
+        if len(clients) < len(wins):
+            return False
+        used = set()
+        for w in wins:
+            best_i, best = -1, 0.0
+            for i, c in enumerate(clients):
+                if i in used:
+                    continue
+                r = difflib.SequenceMatcher(None, norm_title(c["title"]), norm_title(w["title"])).ratio()
+                if r > best:
+                    best, best_i = r, i
+            if best < 0.8:
+                return False
+            used.add(best_i)
+        return True
+
+    def reorder_tiled(self, sess):
+        """For tiled windows sharing a workspace, swap until left-to-right matches saved at[0].
+
+        Chrome (and other multi-window apps) often reopen windows in an order that
+        leaves two side-by-side windows swapped. Floating windows already get exact
+        x/y from place(); this only touches tiled ones."""
+        # Build address → saved window for everything we placed via pending
+        saved_by_addr = {}
+        # Re-read live clients once
+        live = {c["address"]: c for c in hypr_json("clients")}
+        # Use current positions of windows that match saved titles on each workspace
+        by_ws = {}
+        for it in sess.get("items") or []:
+            if it.get("kind") not in ("browser", "app", "webapp"):
+                continue
+            for w in it.get("windows") or []:
+                if w.get("floating") or not w.get("at"):
+                    continue
+                # find live client with best title match on that workspace, unclaimed-or-any
+                ws = w.get("workspace")
+                candidates = [c for c in live.values()
+                              if (c.get("workspace") or {}).get("id") == ws
+                              and not c.get("floating")
+                              and (c.get("class") == it["class"] or c.get("initialClass") == it["class"])]
+                if not candidates:
+                    continue
+                best = max(candidates,
+                           key=lambda c: difflib.SequenceMatcher(
+                               None, norm_title(c.get("title")), norm_title(w.get("title"))).ratio())
+                score = difflib.SequenceMatcher(
+                    None, norm_title(best.get("title")), norm_title(w.get("title"))).ratio()
+                if score < 0.8:
+                    continue
+                by_ws.setdefault(ws, []).append((best["address"], w["at"][0], best))
+
+        for ws, entries in by_ws.items():
+            if len(entries) < 2:
+                continue
+            # desired: sort by saved x; actual: sort by current x
+            desired = [a for a, x, _ in sorted(entries, key=lambda t: t[1])]
+            # bubble-swap neighbors that are out of order
+            for _ in range(len(desired)):
+                live = {c["address"]: c for c in hypr_json("clients")}
+                actual = sorted(desired, key=lambda a: (live.get(a, {}).get("at") or [0])[0])
+                if actual == desired:
+                    break
+                # find first inversion in actual relative to desired index
+                rank = {a: i for i, a in enumerate(desired)}
+                swapped = False
+                for i in range(len(actual) - 1):
+                    if rank[actual[i]] > rank[actual[i + 1]]:
+                        addr = actual[i]
+                        dispatch(f"hl.dsp.window.swap({{ direction = {lua_long('r')}, window = {lua_long('address:' + addr)} }})")
+                        swapped = True
+                        time.sleep(0.05)
+                        break
+                if not swapped:
+                    break
+
     def run(self, sess):
         items = ordered_items(sess)
         for it in items:
             k, cls, wins = it["kind"], it["class"], it["windows"]
             try:
                 if k == "browser":
-                    if self.unclaimed(cls, include_known=True):
-                        log(f"restore: {cls} already running; placing its windows by title")
-                        self.known -= {c["address"] for c in self.unclaimed(cls, include_known=True)}
-                    elif not self.launch(it["argv"], primary_ws(it)):
-                        self.failed.append(cls)
-                        continue
+                    existing = self.unclaimed(cls, include_known=True)
+                    covered = self._titles_covered(existing, wins)
+                    if existing and covered:
+                        log(f"restore: {cls} already has these windows; placing by title")
+                        self.known -= {c["address"] for c in existing}
+                    else:
+                        # Always launch per profile. Chromium's singleton opens the
+                        # profile in the existing process (or starts the browser).
+                        # Launching without --profile-directory shows the profile picker
+                        # when more than one profile was last active.
+                        if existing:
+                            self.known -= {c["address"] for c in existing}
+                        if not self.launch(it["argv"], primary_ws(it)):
+                            self.failed.append(cls)
+                            continue
                     self.pending.append({"class": cls, "remaining": list(wins),
+                                         "placed": [],
                                          "deadline": time.time() + self.cfg["browser_wait_seconds"]})
                     continue
                 if k in ("app", "webapp"):
@@ -1709,6 +1970,7 @@ class Restorer:
         while self.pending:
             self.step_pending(final=False)
             time.sleep(1)
+        self.reorder_tiled(sess)
         if self.refocus and self.prev_focus:
             dispatch(f"hl.dsp.focus({{ window = {lua_long('address:' + self.prev_focus)} }})")
         return self.placed, self.failed

@@ -13,7 +13,7 @@ atomic state, restore-once guarantees and a dry-run mode. See `LICENSE`.
 | Kind | How it's detected | How it comes back |
 |---|---|---|
 | **Terminals** (ghostty, kitty, alacritty, foot, wezterm, konsole, gnome-terminal, kgx, ptyxis, xfce4-terminal, tilix, terminator, rio, urxvt, st, xterm, contour, or anything whose `.desktop` file says `TerminalEmulator`) | process name / window class table + desktop categories | one window per saved window, launched with that terminal's own working-directory flag (or `env -C`, or `xdg-terminal-exec --dir` for an unknown default terminal). If a known TUI was in the foreground (herdr, tmux, zellij, nvim, btop, lazygit, yazi, …) it is started again, and you drop back to your shell when it exits. A **coding agent** (claude, codex, grok, cursor-agent, gemini, kimi, opencode, …) is resumed into the same conversation. With the shell hook, each window also gets back its **Atuin session** and its **tabs** (see below). |
-| **Browsers** (Chrome, Chromium, Brave, Edge, Vivaldi, Opera, Helium, Thorium, Firefox, LibreWolf, Zen, Floorp, Waterfox, … or any `WebBrowser` desktop entry) | desktop category / binary table | launched **once**; the browser reopens its own windows (needs "Continue where you left off"), then each window is moved to its saved workspace by matching titles. |
+| **Browsers** (Chrome, Chromium, Brave, Edge, Vivaldi, Opera, Helium, Thorium, Firefox, LibreWolf, Zen, Floorp, Waterfox, … or any `WebBrowser` desktop entry) | desktop category / binary table | Chromium-family browsers are launched **once per profile** with `--profile-directory=…` (skips the profile picker when several profiles were open). Each profile reopens its own windows, then windows are moved to their saved workspaces by matching titles. Firefox-family browsers still launch once. |
 | **Web apps** (`chrome-<site>-Default` style classes from `omarchy-launch-webapp` / `--app=`) | window class pattern | each one individually, via its `.desktop` file (`StartupWMClass`), else `--app=URL` from the process, else a URL rebuilt from the class. |
 | **Everything else** | `/proc/<pid>/cmdline`, flatpak cgroup, `$APPIMAGE`, `.desktop` file lookup | relaunched with the same argv (or `flatpak run`, the AppImage, or the desktop `Exec`). Multi-window apps launch once; extra windows are matched by title. |
 
@@ -174,8 +174,15 @@ rm -r ~/.local/state/omarchy/session-restore ~/.config/omarchy/session-restore.j
 ## Limitations
 
 * Browsers only get their windows back if the browser itself restores them
-  (Chrome: Settings → On startup → *Continue where you left off*). Windows are
-  matched by title, so two windows with near-identical titles may swap.
+  (Chrome: Settings → On startup → *Continue where you left off*, or crash
+  recovery after a reboot). Chromium-family multi-profile setups launch each
+  profile with `--profile-directory` so the profile picker does not appear.
+  Windows are matched by title (and, for Chromium, attributed to a profile via
+  the signed-in email in the title or titles stored in that profile's session
+  files).
+* Two tiled windows on the same workspace are re-ordered left-to-right after
+  restore to match their saved positions; if Hyprland's layout still disagrees
+  they may remain swapped — drag one past the other once.
 * Terminal scrollback and running processes aren't preserved, only the
   folder, the Atuin session (with the hook), a known TUI program relaunched
   fresh, and coding agents resumed into their conversation.
