@@ -1,45 +1,167 @@
 # Session Restore for Omarchy (`eric.session-restore`)
 
-An Omarchy 4.5 plugin that remembers your open windows and puts them back
-after a reboot, logout or crash: same apps, same workspaces, terminals in the
-same folders.
+**macOS-like session restore for Omarchy / Hyprland.**
 
-Derived from [wbarakat/omarchy-session-restore](https://github.com/wbarakat/omarchy-session-restore)
-(MIT, © 2026 Waleed) — rewritten in Python with generic app detection,
-atomic state, restore-once guarantees and a dry-run mode. See `LICENSE`.
+Reboot, log out, or crash — and come back to the same apps on the same
+workspaces: terminals in the folders you left them, Chrome profiles with their
+tabs, coding agents back in the same conversation. Dock your laptop and get
+the docked layout; undock and get the laptop layout. No manual rearrange.
+
+Omarchy already has a great desktop. What it does not ship is “put my windows
+back.” This plugin fills that gap with a keep-loaded service that autosaves
+quietly and restores once on the next login.
+
+| | |
+|---|---|
+| **Plugin id** | `eric.session-restore` |
+| **Version** | 1.3.0 |
+| **License** | MIT |
+| **Author** | Eric Westphal &lt;BonanzaEric@gmail.com&gt; |
+| **Based on** | [wbarakat/omarchy-session-restore](https://github.com/wbarakat/omarchy-session-restore) (MIT, © 2026 Waleed) |
+
+---
+
+## Why use it
+
+- **One reboot, same desk.** Apps, workspaces, floating size/position,
+  fullscreen, maximized, and pin come back without a restore wizard.
+- **Terminals that feel continuous.** Each window returns in its working
+  directory; with the optional shell hook you also get the same **Atuin
+  session**, Ghostty **tabs**, and a **coding agent** resumed into the same
+  conversation (Claude, Codex, Grok, Cursor Agent, Gemini, …).
+- **Multi-profile Chrome that just works.** Chromium-family browsers launch
+  once per profile with `--profile-directory=…`, so the profile picker never
+  interrupts restore. Pair with Chrome → Settings → On startup →
+  **Continue where you left off**.
+- **Docked vs undocked layouts.** A separate layout is remembered for each
+  display fingerprint (make/model/serial + geometry). Hotplug settles, then
+  windows re-place themselves. First time on a new dock or USB-C display you
+  arrange once; after that it is automatic.
+- **Safe by default.** Atomic state files (mode 600), restore-at-most-once,
+  dry-run mode, and menu rows that take a final snapshot before Omarchy closes
+  windows for logout / reboot / shutdown.
+- **Install in one command.** Public Git URL — no cloning required.
+
+---
+
+## Features
+
+| Area | What you get |
+|---|---|
+| **Windows** | Apps relaunched on the workspaces they were on; floating geometry, fullscreen, maximized, pin |
+| **Terminals** | ghostty, kitty, alacritty, foot, wezterm, and any `TerminalEmulator` desktop entry — cwd restored; optional Atuin session + tabs + agent resume |
+| **Browsers** | Chrome / Chromium / Brave / Edge / Vivaldi / … once per profile; Firefox-family once; web apps via `.desktop` / `--app=` |
+| **Other apps** | Flatpak, AppImage, and argv from `/proc` — multi-window apps launch once, extras matched by title |
+| **Per-display** | Fingerprint-keyed layouts under `~/.local/state/omarchy/session-restore/layouts/` |
+| **Autosave** | Every 60 s and ~3 s after window changes; skipped while the system is stopping |
+| **Menu** | Save Session, plus Logout / Reboot / Shutdown that snapshot first |
+| **CLI** | `status`, `save`, `restore --dry-run`, `--force`, `--prev`, disable/enable |
+
+---
+
+## Install
+
+Requires Omarchy 4.5+ with the plugin system.
+
+```bash
+omarchy plugin add https://github.com/westphae/omarchy-session-restore.git --enable
+```
+
+Then put the CLI on your `PATH` and (optionally) wire the menu + shell hook:
+
+```bash
+ln -sf ~/.config/omarchy/plugins/eric.session-restore/bin/omarchy-session ~/.local/bin/omarchy-session
+
+# Optional: final snapshot before logout / reboot / shutdown
+# Merge extensions/omarchy-menu-snippet.jsonc into
+# ~/.config/omarchy/extensions/omarchy-menu.jsonc, then:
+omarchy menu refresh
+
+# Optional: per-window Atuin sessions, Ghostty tabs, coding-agent resume
+omarchy-session install-hook
+```
+
+Update later:
+
+```bash
+omarchy plugin update eric.session-restore
+```
+
+Disable without removing: `omarchy-session disable` (or
+`omarchy plugin disable eric.session-restore`).
+
+Remove completely:
+
+```bash
+omarchy-session uninstall-hook   # if you installed the hook
+omarchy plugin remove eric.session-restore
+rm -f ~/.local/bin/omarchy-session
+# delete the four session rows from ~/.config/omarchy/extensions/omarchy-menu.jsonc
+omarchy menu refresh
+rm -rf ~/.local/state/omarchy/session-restore ~/.config/omarchy/session-restore.json
+```
+
+---
+
+## Quick start
+
+1. Install and enable (above).
+2. Open a few apps, rearrange workspaces, wait ~60 s (or run
+   `omarchy-session save`).
+3. Reboot from the Omarchy menu (so the final snapshot runs).
+4. After login, windows come back on their workspaces.
+
+Check status anytime:
+
+```bash
+omarchy-session status
+omarchy-session restore --dry-run   # print what would launch; change nothing
+```
+
+### Chrome: Continue where you left off
+
+Browsers only reopen their tabs if the browser itself restores them. In
+Chrome (and Chromium-family browsers):
+
+**Settings → On startup → Continue where you left off**
+
+Do that once per profile you care about. This plugin launches each profile
+correctly; Chrome restores the tabs inside those windows.
+
+---
 
 ## What gets restored
 
-| Kind | How it's detected | How it comes back |
+| Kind | Detection | Restore behavior |
 |---|---|---|
-| **Terminals** (ghostty, kitty, alacritty, foot, wezterm, konsole, gnome-terminal, kgx, ptyxis, xfce4-terminal, tilix, terminator, rio, urxvt, st, xterm, contour, or anything whose `.desktop` file says `TerminalEmulator`) | process name / window class table + desktop categories | one window per saved window, launched with that terminal's own working-directory flag (or `env -C`, or `xdg-terminal-exec --dir` for an unknown default terminal). If a known TUI was in the foreground (herdr, tmux, zellij, nvim, btop, lazygit, yazi, …) it is started again, and you drop back to your shell when it exits. A **coding agent** (claude, codex, grok, cursor-agent, gemini, kimi, opencode, …) is resumed into the same conversation. With the shell hook, each window also gets back its **Atuin session** and its **tabs** (see below). |
-| **Browsers** (Chrome, Chromium, Brave, Edge, Vivaldi, Opera, Helium, Thorium, Firefox, LibreWolf, Zen, Floorp, Waterfox, … or any `WebBrowser` desktop entry) | desktop category / binary table | Chromium-family browsers are launched **once per profile** with `--profile-directory=…` (skips the profile picker when several profiles were open). Each profile reopens its own windows, then windows are moved to their saved workspaces by matching titles. Firefox-family browsers still launch once. |
-| **Web apps** (`chrome-<site>-Default` style classes from `omarchy-launch-webapp` / `--app=`) | window class pattern | each one individually, via its `.desktop` file (`StartupWMClass`), else `--app=URL` from the process, else a URL rebuilt from the class. |
-| **Everything else** | `/proc/<pid>/cmdline`, flatpak cgroup, `$APPIMAGE`, `.desktop` file lookup | relaunched with the same argv (or `flatpak run`, the AppImage, or the desktop `Exec`). Multi-window apps launch once; extra windows are matched by title. |
+| **Terminals** | process / class table + `TerminalEmulator` desktop category | One window per saved window, with that terminal’s working-directory flag (or `env -C` / `xdg-terminal-exec --dir`). Known TUIs (herdr, tmux, zellij, nvim, btop, lazygit, yazi, …) relaunch; coding agents resume the same conversation. With the shell hook: Atuin session + tabs. |
+| **Browsers** | `WebBrowser` desktop category / binary table | Chromium-family: **once per profile** with `--profile-directory=…`. Firefox-family: once. Windows moved to saved workspaces by title. |
+| **Web apps** | `chrome-<site>-Default`-style classes | Via `.desktop` (`StartupWMClass`), else `--app=URL`, else URL from class. |
+| **Everything else** | `/proc/<pid>/cmdline`, flatpak cgroup, `$APPIMAGE`, `.desktop` | Same argv / `flatpak run` / AppImage / desktop `Exec`. Multi-window apps launch once; extras matched by title. |
 
 Floating state, size/position (floating windows), fullscreen/maximized and
 pin are re-applied. Per-workspace layout mode (dwindle / scrolling / floating)
-is restored when Omarchy's `o.workspace_mode` is available. Windows on special
-(scratchpad) workspaces are saved and restored when `restore_special` is true
-(the default).
+is restored when Omarchy’s `o.workspace_mode` is available. Windows on special
+(scratchpad) workspaces are saved/restored when `restore_special` is true
+(default).
 
 ### Per-display layouts (docked vs undocked)
 
-Like macOS, a **separate window layout is remembered for each display
-configuration**. The fingerprint is the sorted list of connected monitors
-identified by make/model/serial (Hyprland's `description`, same identity
+A **separate window layout is remembered for each display configuration**,
+like macOS. The fingerprint is the sorted list of connected monitors
+identified by make/model/serial (Hyprland’s `description` — the same identity
 Omarchy uses for workspace blocks) plus resolution, scale and relative
 position — not the connector name (`HDMI-A-1`), which a dock can rename.
 
 Layouts live under `~/.local/state/omarchy/session-restore/layouts/<hash>/`
-and are never consumed on restore, so docking again can find them. On
-monitor hotplug the daemon waits `monitor_settle_seconds` (default 3),
-saves the previous layout, then re-places already-open windows to match
-the layout for the new fingerprint when one exists. A brand-new display
-config gets Hyprland's defaults until you arrange windows and a save
-runs.
+and are never consumed on restore, so docking again can find them. On monitor
+hotplug the daemon waits `monitor_settle_seconds` (default 3), saves the
+previous layout, then re-places already-open windows to match the layout for
+the new fingerprint when one exists. A **brand-new** display config (first
+time on that dock or portable display) gets Hyprland’s defaults until you
+arrange windows and a save runs.
 
-### Hyprland / Omarchy coverage
+### Coverage vs Hyprland
 
 | Feature | Support | Notes |
 |---|---|---|
@@ -47,129 +169,96 @@ runs.
 | Floating / tiled | **full** | floating flag toggled on restore |
 | Floating size + position | **full** | clamped onto a live monitor if the saved display is gone |
 | Fullscreen / maximized | **full** | |
-| Pin (show on all workspaces) | **full** | Hyprland pin; not macOS-style edge snap (Hyprland has no edge-pin) |
+| Pin (all workspaces) | **full** | Hyprland pin; not macOS-style edge snap |
 | Monitor placement | **full** | workspace moved onto the matching physical monitor by identity |
 | Per-display layouts | **full** | fingerprint-keyed; hotplug settle + relayout |
-| Workspace layout mode | **partial** | dwindle / scrolling / floating via `o.workspace_mode`; exact dwindle split tree **not** exposed by Hyprland |
+| Workspace layout mode | **partial** | dwindle / scrolling / floating via `o.workspace_mode`; **exact dwindle split tree is not exposed by Hyprland** |
 | Scrolling column widths | **unsupported** | hyprscrolling options are global; per-column widths not in IPC |
 | Special / scratchpad | **partial** | saved/restored by name (`special:scratchpad`); may interact with Omarchy qconsole |
-| Window groups | **unsupported** | `grouped` count is recorded; group membership is not rebuilt |
-| Workspace groups / binds | **n/a** | Omarchy owns per-monitor workspace blocks (`monitor-workspaces`); we don't override them |
+| Window groups | **unsupported** | `grouped` count is recorded; membership is not rebuilt |
 
-There is **no** native Hyprland “layout dump” file. Everything goes through
-`hyprctl -j` (clients / workspaces / monitors) plus Omarchy's own state under
-`~/.local/state/omarchy/workspace-layouts` (SUPER+L toggle) and
-`monitor-workspaces`. This plugin reads Hyprland IPC and writes its own
-session JSON.
+There is **no** native Hyprland “layout dump.” Everything goes through
+`hyprctl -j` plus this plugin’s own session JSON.
 
-## Terminals: Atuin sessions, tabs and coding agents
+---
+
+## Terminals: Atuin, tabs, coding agents
 
 Run `omarchy-session install-hook` once. It adds one line to `~/.bashrc`
 (and `~/.zshrc` if present) right after `atuin init`, with a backup:
 
-```
+```bash
 [ -f ~/.config/omarchy/plugins/eric.session-restore/shell/session-hook.sh ] && . ~/.config/omarchy/plugins/eric.session-restore/shell/session-hook.sh  # omarchy-session-restore hook
 ```
 
-`shell/session-hook.sh` is small. At shell start it records `$ATUIN_SESSION`
-in `$XDG_RUNTIME_DIR/omarchy-session-restore/shell-<pid>` (mode 600). Atuin
-picks its session id inside the shell, so `/proc/<pid>/environ` never shows
-it. When a restore opened the terminal, the hook asks `omarchy-session
-claim-tab` for that tab's saved state and applies it: `cd`, `export
-ATUIN_SESSION=…`, and the program to resume, which runs at the first prompt
-so the shell stays open after it exits. All values are validated and
-shell-quoted.
+At shell start the hook records `$ATUIN_SESSION` under
+`$XDG_RUNTIME_DIR/omarchy-session-restore/` (mode 600). When a restore opened
+the terminal, it claims that tab’s saved state: `cd`, `export ATUIN_SESSION=…`,
+and the program to resume at the first prompt so the shell stays open after
+it exits. Values are validated and shell-quoted.
 
-**Atuin.** Reusing a session id is safe. Atuin stores the session as a
-plain column on each history row, with no uniqueness rule, so a restored
-window keeps adding to the same session. Its *session* filter (Ctrl-R, then
-cycle the filter mode) shows that window's commands from before the reboot.
-Your `filter_mode` is not changed. If you use Atuin's up-arrow binding,
-`filter_mode_shell_up_key_binding = "session"` makes up-arrow per-window too.
+**Atuin.** Reusing a session id is safe — Atuin stores it as a plain column
+with no uniqueness rule. The session filter (Ctrl-R, cycle filter mode) shows
+that window’s commands from before the reboot. Optional:
+`filter_mode_shell_up_key_binding = "session"` for per-window up-arrow.
 
-**Tabs and splits.** Ghostty doesn't say which window a shell belongs to.
-Leftover shells (tabs and splits) are attached to the window whose first
-shell started most recently before them. On restore, Ghostty windows get their
-tabs back through Ghostty's D-Bus window actions (`new-tab`), with each tab's
-own cwd, Atuin session and program. Ghostty only acts on the focused window,
-so the restored window is focused briefly and focus goes back afterwards.
-Splits come back as tabs, because the split layout can't be read from
-outside. kitty, wezterm and other terminals get their extra tabs as separate
-windows on the same workspace.
+**Tabs.** Ghostty tabs come back via D-Bus (`new-tab`) with each tab’s cwd,
+Atuin session and program. Splits come back as tabs (split layout isn’t
+readable from outside). Other terminals get extra tabs as separate windows on
+the same workspace.
 
-**Coding agents.** `AGENTS` in `bin/omarchy-session` covers claude, codex,
-grok, cursor-agent, gemini, opencode, kilo, kimi, qwen, copilot, droid,
-devin, qodercli, hermes, pi, omp, agy, letta, mastracode, crush, aider,
-goose and amp, whether they run as a binary, through mise/npm shims or as
-`node …/cli.js`. The session id is found in this order:
+**Coding agents.** Covers claude, codex, grok, cursor-agent, gemini, opencode,
+kimi, and many others (binary, mise/npm shim, or `node …/cli.js`). Session id
+from live state, original argv, or newest transcript — otherwise the agent’s
+own “continue latest” (`claude --continue`, `codex resume --last`, …).
+Permission-skipping flags are never added; one-shot runs (`claude -p`, …) are
+not restarted; no prompt is ever sent. Agents inside herdr are left to herdr.
 
-1. live state: `~/.grok/active_sessions.json`, `~/.claude/sessions/<pid>.json`,
-   or the transcript file the agent has open (codex rollouts, cursor chats,
-   kimi sessions, …);
-2. the original command line (`--resume ID`, `codex resume ID`, …);
-3. for claude, the newest transcript for that directory.
+Without the hook, terminals still return in the right folder with program and
+agent resumed, but each gets a new Atuin session and only one tab.
 
-If no id is found, the agent's own "continue latest in this directory" is
-used, e.g. `claude --continue` or `codex resume --last`. An agent that never
-had a conversation (grok with no registered session) is started fresh rather
-than continuing an older conversation in that directory. Model and permission
-flags are copied from the original command only when they were there.
-Permission-skipping flags such as `--dangerously-skip-permissions` or `--yolo`
-are never added. One-shot runs (`claude -p`, `codex exec`, …) are not
-restarted, and no prompt is ever sent. Agents inside herdr are resumed by
-herdr's own session restore; the plugin only reattaches herdr.
-
-Without the hook, terminals still come back in the right folder with their
-program and agent resumed, but each gets a new Atuin session and only one tab.
+---
 
 ## How it works
 
-* `Service.qml` (a headless omarchy-shell service) runs
-  `bin/omarchy-session daemon`.
-* On start the daemon **restores once**, then **autosaves**: every 60 s and
+* `Service.qml` (headless omarchy-shell service) runs `bin/omarchy-session daemon`.
+* On start the daemon **restores once**, then **autosaves** every 60 s and
   ~3 s after window open/close/move/float/fullscreen events.
-* The reboot / shutdown / logout menu rows run
-  `omarchy-session save --final` first (an exact final snapshot that also
-  freezes autosave for 2 minutes so Omarchy's "close all windows" step can't
-  overwrite it), then the stock `omarchy-system` command.
-* Autosave also refuses to write while the system is stopping, while an
-  `omarchy-system reboot|shutdown|logout` is running, or when there are no
-  windows at all.
-
-Launch commands are worked out **at save time** (while `/proc` still knows
-everything) and stored as argv lists. Restore never runs a saved string
-through `sh -c`: argv is shell-quoted with `shlex` and handed to Hyprland's
-`hl.dsp.exec_cmd` with a `[workspace N silent]` rule, then the window is
-moved to its workspace by address in case the app handed off to an existing
-process.
+* Menu Logout / Reboot / Shutdown run `omarchy-session save --final` first
+  (exact final snapshot; freezes autosave for 2 minutes so Omarchy’s “close
+  all windows” step cannot overwrite it), then the stock `omarchy-system`
+  command.
+* Launch commands are computed **at save time** (while `/proc` still knows
+  everything) and stored as argv lists. Restore never runs a saved string
+  through `sh -c`.
 
 ### Safety
 
-* State lives in `~/.local/state/omarchy/session-restore/` (mode 700);
-  `session.json` is mode 600, written atomically (temp file + fsync +
-  rename), and the previous distinct version is kept as `session.prev.json`.
-  Files that aren't yours or are group/world-writable are refused.
-* A session is restored **at most once**: it is moved to `restored/` before
-  anything launches, and its hash is recorded in `last-restore.json`.
-* Not restored if: it was saved by the *current* Hyprland session (so
-  restarting omarchy-shell does nothing), it's older than `max_age_hours`
-  (default 7 days), or Hyprland has been up longer than 15 minutes.
-* Apps that are already open (e.g. autostarted) are claimed instead of
-  launched a second time; a browser that is already running is not launched.
+* State in `~/.local/state/omarchy/session-restore/` (mode 700);
+  `session.json` is mode 600, written atomically; previous distinct version
+  kept as `session.prev.json`.
+* Restored **at most once**: moved to `restored/` before launch; hash in
+  `last-restore.json`.
+* Skipped if saved by the *current* Hyprland session, older than
+  `max_age_hours` (default 7 days), or Hyprland has been up longer than
+  15 minutes.
+* Apps already open (e.g. autostart) are claimed, not double-launched.
+
+---
 
 ## Usage
 
-```
+```bash
 omarchy-session status              # daemon, saved session, last restore
 omarchy-session save                # save now (also: menu → System → Save Session)
-omarchy-session restore --dry-run   # print exactly what would be launched (alias --print)
-omarchy-session restore --force     # restore now even if the checks would skip it
-omarchy-session restore --prev      # use the previous good copy
-omarchy-session restore --file F    # restore a specific file (not consumed)
-omarchy-session restore --file F --workspace 4   # only the windows saved on workspace 4
-omarchy-session install-hook        # per-window Atuin sessions, tabs, agent resume (see above)
+omarchy-session restore --dry-run   # print what would launch (alias --print)
+omarchy-session restore --force     # restore now even if checks would skip
+omarchy-session restore --prev      # previous good copy
+omarchy-session restore --file F    # specific file (not consumed)
+omarchy-session restore --file F --workspace 4
+omarchy-session install-hook        # Atuin + tabs + agents
 omarchy-session uninstall-hook
-omarchy-session disable | enable    # turn autosave + auto-restore off/on
+omarchy-session disable | enable
 ```
 
 Log: `~/.local/state/omarchy/session-restore/session-restore.log`
@@ -186,70 +275,63 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
   "skip_classes": ["org.pulseaudio.pavucontrol"],
   "resume_commands": ["herdr", "tmux", "zellij", "nvim", "btop", "lazygit", "yazi"],
   "notify": true,
-  "resume_agents": true
+  "resume_agents": true,
+  "per_display": true,
+  "restore_special": true,
+  "monitor_settle_seconds": 3
 }
 ```
 
-
-## Configuration
-
-Optional keys in `~/.config/omarchy/session-restore.json`:
-
 | Key | Default | Meaning |
 |---|---|---|
-| `per_display` | `true` | Remember a separate layout per display fingerprint (docked vs undocked) |
-| `restore_special` | `true` | Save/restore windows on special/scratchpad workspaces |
+| `enabled` | `true` | Autosave + auto-restore |
+| `max_age_hours` | `168` | Don’t restore sessions older than this |
+| `max_login_age_seconds` | `900` | Only auto-restore this soon after Hyprland starts |
+| `save_interval_seconds` | `60` | Periodic autosave interval |
+| `browser_wait_seconds` | `60` | How long to wait for browser windows to appear |
+| `skip_classes` | `[]` | Window classes never saved (full-match regexes) |
+| `resume_commands` | *(built-in TUI list)* | Foreground programs to relaunch in terminals |
+| `notify` | `true` | Desktop notifications on restore |
+| `resume_agents` | `true` | Resume coding agents into their conversation |
+| `per_display` | `true` | Separate layout per display fingerprint |
+| `restore_special` | `true` | Save/restore special/scratchpad workspaces |
 | `monitor_settle_seconds` | `3` | Delay after monitor hotplug before switching layouts |
 
+---
 
-## Install / remove
+## Limitations (honest)
 
-```
-omarchy plugin add ~/src/omarchy-session-restore --enable --yes
-ln -sf ~/.config/omarchy/plugins/eric.session-restore/bin/omarchy-session ~/.local/bin/omarchy-session
-# merge extensions/omarchy-menu-snippet.jsonc into ~/.config/omarchy/extensions/omarchy-menu.jsonc
-omarchy menu refresh
-```
-
-Update after editing the repo: commit, then `omarchy plugin update eric.session-restore --yes`.
-
-Turn off temporarily: `omarchy-session disable` (or `omarchy plugin disable eric.session-restore`).
-
-Remove completely:
-
-```
-omarchy plugin remove eric.session-restore
-rm ~/.local/bin/omarchy-session
-# delete the four session rows from ~/.config/omarchy/extensions/omarchy-menu.jsonc, then:
-omarchy menu refresh
-rm -r ~/.local/state/omarchy/session-restore ~/.config/omarchy/session-restore.json
-```
-
-## Limitations
-
-* Browsers only get their windows back if the browser itself restores them
-  (Chrome: Settings → On startup → *Continue where you left off*, or crash
-  recovery after a reboot). Chromium-family multi-profile setups launch each
-  profile with `--profile-directory` so the profile picker does not appear.
-  Windows are matched by title (and, for Chromium, attributed to a profile via
-  the signed-in email in the title or titles stored in that profile's session
-  files).
-* Two tiled windows on the same workspace are re-ordered left-to-right after
-  restore to match their saved positions; if Hyprland's layout still disagrees
-  they may remain swapped — drag one past the other once.
-* Terminal scrollback and running processes aren't preserved, only the
-  folder, the Atuin session (with the hook), a known TUI program relaunched
-  fresh, and coding agents resumed into their conversation.
-* Tab-to-window assignment is a guess based on start times. Ghostty splits
-  come back as tabs. Terminals that were open before the hook was installed
-  get a new Atuin session the first time around. Restored ghostty windows
-  run as separate processes (`--gtk-single-instance=false`) because a
-  single-instance hand-off ignores `--working-directory`.
-* Apps whose window title/state lives inside the app (editors, Electron apps)
-  reopen however they normally do; documents aren't reopened unless they were
+* **Dwindle split tree** — Hyprland does not expose the exact split tree over
+  IPC. Workspace *mode* (dwindle / scrolling / floating) is restored; exact
+  split ratios are not. Tiled windows are re-ordered left-to-right; if the
+  layout still disagrees, drag one past the other once.
+* **Scrolling column widths** — hyprscrolling column widths are not in IPC.
+* **First time on a new dock / display** — no saved layout yet; arrange once,
+  then autosave remembers it for next time.
+* **Browsers** need their own session restore (Chrome: *Continue where you
+  left off*). Titles are used to match windows to workspaces/profiles.
+* **Terminal scrollback** and arbitrary running processes are not preserved —
+  only folder, Atuin session (with hook), known TUIs, and coding-agent
+  conversations.
+* **Ghostty splits** come back as tabs; tab-to-window assignment is based on
+  shell start times. Ghostty restored windows run with
+  `--gtk-single-instance=false` so `--working-directory` is honored.
+* **In-app documents** reopen however the app normally does, unless they were
   on the original command line.
-* Tiled layout order is approximated by launching left-to-right per workspace;
-  exact split ratios aren't restored.
-* A hard power-off without the menu still restores the last autosave (≤ 60 s old).
-* Logging out via `uwsm stop` / a keybinding rather than the menu skips the
-  final snapshot (the autosave is used instead).
+* A hard power-off still restores the last autosave (≤ 60 s old). Logging out
+  via `uwsm stop` / a keybinding instead of the menu skips the final snapshot.
+
+---
+
+## Attribution & license
+
+Derived from
+[wbarakat/omarchy-session-restore](https://github.com/wbarakat/omarchy-session-restore)
+(MIT, © 2026 Waleed) — rewritten in Python with generic app detection, atomic
+state, restore-once guarantees, dry-run mode, per-profile Chrome launch, and
+per-display layouts. See `LICENSE`.
+
+MIT © 2026 Waleed and Eric Westphal.
+
+Questions / bugs: BonanzaEric@gmail.com ·
+[github.com/westphae/omarchy-session-restore](https://github.com/westphae/omarchy-session-restore)
