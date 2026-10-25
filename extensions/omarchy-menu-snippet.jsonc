@@ -1,7 +1,10 @@
-// Merge these rows into ~/.config/omarchy/extensions/omarchy-menu.jsonc and run
-// `omarchy menu refresh`. They take a final snapshot of your windows right
-// before Omarchy closes them for logout / reboot / shutdown, then hand over to
-// the stock `omarchy-system` command. (Replace the path if your home differs.)
+// Optional. Copy this file to ~/.config/omarchy/extensions/omarchy-menu.jsonc
+// if you do not already have one, or add these four keys inside the existing
+// { }, then run `omarchy menu refresh`.
+//
+// Logout / Reboot / Shutdown take a final snapshot before Omarchy closes
+// your windows, then run the stock `omarchy-system` command. The menu
+// expands $HOME when it runs the action, so the paths below can stay as-is.
 {
   "system.session-save": {"icon":"󰆓","label":"Save Session","action":"$HOME/.local/bin/omarchy-session save"},
   "system.logout": {"icon":"󰍃","label":"Logout","action":"$HOME/.local/bin/omarchy-session save --final --quiet; omarchy-system logout"},
