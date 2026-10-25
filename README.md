@@ -21,6 +21,182 @@ quietly and restores once on the next login.
 
 ---
 
+## How this differs from desk save-slot plugins
+
+Plugins such as **Tableau by Novuon** save a desktop under a name
+(**Capture Current Desktop**) and switch to that desk when you ask.
+`Super` + `Alt` + `T` opens the switcher. Switching closes the desktop you
+are on. Tableau waits until you pick a desk; it does not restore one at login.
+
+Session Restore is the automatic one. It keeps a quiet copy of whatever you
+are already doing and puts those same windows back after a reboot or logout.
+
+---
+
+## Install
+
+You need **Omarchy 4.5 or newer**, with the plugin system (`omarchy plugin …`).
+
+Open a terminal (`Super` + `Return`) and paste:
+
+```bash
+omarchy plugin add https://github.com/westphae/omarchy-session-restore.git --enable
+```
+
+Omarchy warns you that a plugin runs as your user, then asks you to confirm.
+Say yes. Omarchy clones this repo into
+`~/.config/omarchy/plugins/eric.session-restore` and turns it on. Autosave
+and restore start on their own.
+
+That Git URL is the supported install. Use the same URL in the menu below.
+
+### From the Omarchy menu
+
+`Super` + `Space` → **Setup** → **Plugins** → **Add Plugin**.
+
+A terminal opens and asks for a Git URL. Paste:
+
+```text
+https://github.com/westphae/omarchy-session-restore.git
+```
+
+Confirm the prompts. When it asks whether to enable the plugin, say yes.
+The command above passes `--enable` for you; the menu waits for that answer.
+If you leave it off, turn it on later from
+**Setup → Plugins → Enable Plugin**, or:
+
+```bash
+omarchy plugin enable eric.session-restore
+```
+
+### Optional follow-ups
+
+Skip all of these and the plugin still saves and restores. Each one adds
+something specific.
+
+**1. A short command.** So you can type `omarchy-session` in a terminal.
+Omarchy’s default shell already includes `~/.local/bin`. The menu rows in
+step 2 call this path.
+
+```bash
+ln -sf ~/.config/omarchy/plugins/eric.session-restore/bin/omarchy-session ~/.local/bin/omarchy-session
+```
+
+**2. Menu rows, for a snapshot as you leave.** **System → Logout**,
+**Reboot**, and **Shutdown** save your windows once more before Omarchy
+closes them, and **System → Save Session** shows up. Do step 1 first.
+
+Without these rows, a reboot still restores the latest autosave, which can
+be about a minute old. The rows matter because Omarchy closes windows on the
+way out, and a save in the middle of that can record a half-empty desk. The
+menu snapshot runs first and then freezes autosave so those closing windows
+cannot replace it.
+
+If `~/.config/omarchy/extensions/omarchy-menu.jsonc` does not exist yet:
+
+```bash
+mkdir -p ~/.config/omarchy/extensions
+cp ~/.config/omarchy/plugins/eric.session-restore/extensions/omarchy-menu-snippet.jsonc \
+   ~/.config/omarchy/extensions/omarchy-menu.jsonc
+omarchy menu refresh
+```
+
+If that file already exists, add the four keys from the snippet
+(`system.session-save`, `system.logout`, `system.reboot`,
+`system.shutdown`) inside the existing `{ }`. They override the stock
+logout, reboot, and shutdown actions. Keep a single object: a second `{` or
+a missing comma makes Omarchy ignore the whole extensions file. Then run
+`omarchy menu refresh`.
+
+The snippet uses `$HOME`, which the menu expands. If you already customized
+those three system actions, put `omarchy-session save --final --quiet;` in
+front of your command instead of replacing it.
+
+**3. Shell hook, for terminal continuity.** Each terminal comes back with
+the same Atuin history and Ghostty tabs, and a resumed program stays inside
+the shell. Without the hook, terminals still reopen in the right folder,
+with their program and coding agent, but each gets a new Atuin session and
+a single tab. Bash and zsh only.
+
+```bash
+omarchy-session install-hook
+```
+
+That needs step 1. New terminals pick the hook up; ones already open keep
+working as they are until you restart them.
+
+### Update, pause, or remove
+
+Update (Omarchy shows the diff before it applies):
+
+```bash
+omarchy plugin update eric.session-restore
+```
+
+Pause autosave and auto-restore, and leave the plugin installed:
+
+```bash
+omarchy-session disable
+```
+
+`omarchy plugin disable eric.session-restore`, or
+**Setup → Plugins → Disable Plugin**, unloads the plugin.
+Turn it back on with `omarchy-session enable` or
+`omarchy plugin enable eric.session-restore`.
+
+Remove:
+
+```bash
+omarchy-session uninstall-hook   # only if you installed the shell hook
+omarchy plugin remove eric.session-restore
+rm -f ~/.local/bin/omarchy-session
+```
+
+**Setup → Plugins → Remove Plugin** removes it the same way. If you merged
+the menu snippet, delete those four keys from
+`~/.config/omarchy/extensions/omarchy-menu.jsonc` and run
+`omarchy menu refresh`. Saved sessions stay in
+`~/.local/state/omarchy/session-restore`, and settings stay in
+`~/.config/omarchy/session-restore.json`, until you delete them.
+
+---
+
+## Quick start
+
+1. Install and enable (above), and say yes to the prompt.
+2. Open a few apps and arrange your workspaces. Wait about a minute, or save now:
+
+   ```bash
+   omarchy-session save
+   ```
+
+   Without the short command:
+   `~/.config/omarchy/plugins/eric.session-restore/bin/omarchy-session save`
+
+3. Reboot or log out the way you usually do. With the menu rows installed,
+   use **System → Reboot** (or Logout / Shutdown) so the last snapshot is
+   taken as the windows close.
+4. Log back in. The windows come back on their workspaces.
+
+See what is saved, or what a restore would launch, without changing anything:
+
+```bash
+omarchy-session status
+omarchy-session restore --dry-run
+```
+
+### Chrome: Continue where you left off
+
+Browsers only reopen their tabs if the browser itself restores them. In
+Chrome (and Chromium-family browsers):
+
+**Settings → On startup → Continue where you left off**
+
+Do that once per profile you care about. This plugin launches each profile
+correctly; Chrome restores the tabs inside those windows.
+
+---
+
 ## Why use it
 
 - **One reboot, same desk.** Apps, workspaces, floating size/position,
@@ -38,8 +214,8 @@ quietly and restores once on the next login.
   windows re-place themselves. First time on a new dock or USB-C display you
   arrange once; after that it is automatic.
 - **Safe by default.** Atomic state files (mode 600), restore-at-most-once,
-  dry-run mode, and menu rows that take a final snapshot before Omarchy closes
-  windows for logout / reboot / shutdown.
+  dry-run mode, and optional menu rows that take a final snapshot before
+  Omarchy closes windows for logout / reboot / shutdown.
 - **Install in one command.** Public Git URL — no cloning required.
 
 ---
@@ -54,79 +230,8 @@ quietly and restores once on the next login.
 | **Other apps** | Flatpak, AppImage, and argv from `/proc` — multi-window apps launch once, extras matched by title |
 | **Per-display** | Fingerprint-keyed layouts under `~/.local/state/omarchy/session-restore/layouts/` |
 | **Autosave** | Every 60 s and ~3 s after window changes; skipped while the system is stopping |
-| **Menu** | Save Session, plus Logout / Reboot / Shutdown that snapshot first |
+| **Menu** | Optional: Save Session, plus Logout / Reboot / Shutdown that snapshot first |
 | **CLI** | `status`, `save`, `restore --dry-run`, `--force`, `--prev`, disable/enable |
-
----
-
-## Install
-
-Requires Omarchy 4.5+ with the plugin system.
-
-```bash
-omarchy plugin add https://github.com/westphae/omarchy-session-restore.git --enable
-```
-
-Then put the CLI on your `PATH` and (optionally) wire the menu + shell hook:
-
-```bash
-ln -sf ~/.config/omarchy/plugins/eric.session-restore/bin/omarchy-session ~/.local/bin/omarchy-session
-
-# Optional: final snapshot before logout / reboot / shutdown
-# Merge extensions/omarchy-menu-snippet.jsonc into
-# ~/.config/omarchy/extensions/omarchy-menu.jsonc, then:
-omarchy menu refresh
-
-# Optional: per-window Atuin sessions, Ghostty tabs, coding-agent resume
-omarchy-session install-hook
-```
-
-Update later:
-
-```bash
-omarchy plugin update eric.session-restore
-```
-
-Disable without removing: `omarchy-session disable` (or
-`omarchy plugin disable eric.session-restore`).
-
-Remove completely:
-
-```bash
-omarchy-session uninstall-hook   # if you installed the hook
-omarchy plugin remove eric.session-restore
-rm -f ~/.local/bin/omarchy-session
-# delete the four session rows from ~/.config/omarchy/extensions/omarchy-menu.jsonc
-omarchy menu refresh
-rm -rf ~/.local/state/omarchy/session-restore ~/.config/omarchy/session-restore.json
-```
-
----
-
-## Quick start
-
-1. Install and enable (above).
-2. Open a few apps, rearrange workspaces, wait ~60 s (or run
-   `omarchy-session save`).
-3. Reboot from the Omarchy menu (so the final snapshot runs).
-4. After login, windows come back on their workspaces.
-
-Check status anytime:
-
-```bash
-omarchy-session status
-omarchy-session restore --dry-run   # print what would launch; change nothing
-```
-
-### Chrome: Continue where you left off
-
-Browsers only reopen their tabs if the browser itself restores them. In
-Chrome (and Chromium-family browsers):
-
-**Settings → On startup → Continue where you left off**
-
-Do that once per profile you care about. This plugin launches each profile
-correctly; Chrome restores the tabs inside those windows.
 
 ---
 
@@ -224,7 +329,7 @@ agent resumed, but each gets a new Atuin session and only one tab.
 * `Service.qml` (headless omarchy-shell service) runs `bin/omarchy-session daemon`.
 * On start the daemon **restores once**, then **autosaves** every 60 s and
   ~3 s after window open/close/move/float/fullscreen events.
-* Menu Logout / Reboot / Shutdown run `omarchy-session save --final` first
+* With the optional menu snippet, Logout / Reboot / Shutdown run `omarchy-session save --final` first
   (exact final snapshot; freezes autosave for 2 minutes so Omarchy’s “close
   all windows” step cannot overwrite it), then the stock `omarchy-system`
   command.
@@ -250,7 +355,7 @@ agent resumed, but each gets a new Atuin session and only one tab.
 
 ```bash
 omarchy-session status              # daemon, saved session, last restore
-omarchy-session save                # save now (also: menu → System → Save Session)
+omarchy-session save                # save now (also: System → Save Session, after the menu snippet)
 omarchy-session restore --dry-run   # print what would launch (alias --print)
 omarchy-session restore --force     # restore now even if checks would skip
 omarchy-session restore --prev      # previous good copy
