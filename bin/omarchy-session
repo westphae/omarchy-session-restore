@@ -19,6 +19,10 @@
 #     before anything is launched, and its hash is recorded in
 #     last-restore.json. Sessions saved by the *current* Hyprland instance are
 #     never restored (so restarting omarchy-shell is harmless).
+#   * Desktop notifications are fixed sentences (counts, or how old a stale
+#     session is). notify-send arguments are visible to other local accounts
+#     in the process list, so saved window titles and other session text never
+#     go there. Unmatched titles stay in the mode-600 session log.
 
 import argparse
 import ctypes
@@ -267,9 +271,67 @@ def run(argv, timeout=5):
         return 127, str(e)
 
 
-def notify(cfg, summary, body=""):
-    if cfg.get("notify") and shutil.which("notify-send"):
-        run(["notify-send", "-a", "Session Restore", "-i", "view-restore", summary, body])
+def _notify_number(value):
+    """Counts and ages only. Strings are rejected so session text cannot be interpolated."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("notify-send copy accepts numbers only")
+    return value
+
+
+def restore_notify_message(outcome, placed=0, total=0, age_seconds=0, max_age_hours=0):
+    """Return (summary, body) for a restore notification, or None to stay quiet.
+
+    The only non-literal values are numbers. There is no parameter for a
+    window title, path, or other saved-session text, so none can reach
+    notify-send.
+    """
+    if outcome == "stale":
+        age = _notify_number(age_seconds)
+        hours = _notify_number(max_age_hours)
+        return "Session not restored", f"session is stale ({fmt_age(age)} old > {hours}h)"
+    if outcome not in ("complete", "incomplete"):
+        return None
+    summary = f"Restored {int(_notify_number(placed))} of {int(_notify_number(total))} windows"
+    if outcome == "incomplete":
+        return summary, "Some windows could not be restored"
+    return summary, ""
+
+
+def notify_restore(cfg, outcome, placed=0, total=0, age_seconds=0, max_age_hours=0):
+    """Show the restore notification for `outcome`.
+
+    Copy is built by restore_notify_message(). Callers cannot pass a body.
+    """
+    if not cfg.get("notify") or not shutil.which("notify-send"):
+        return
+    try:
+        message = restore_notify_message(outcome, placed=placed, total=total,
+                                         age_seconds=age_seconds, max_age_hours=max_age_hours)
+    except TypeError as e:
+        # Do not log the rejected value: it might be session text.
+        log(f"notify: refused notification ({e})")
+        return
+    if message is None:
+        log("notify: ignoring unknown outcome")
+        return
+    summary, body = message
+    run(["notify-send", "-a", "Session Restore", "-i", "view-restore", summary, body])
+
+
+def note_unmatched_windows(failed, cls, windows):
+    """Log-only description of saved windows that never matched.
+
+    Appends one class-name tally per window onto `failed`. Titles are returned
+    in the log line only — `failed` is summarized later and must not carry them
+    into a notification.
+    """
+    bits = []
+    for w in windows:
+        raw = w.get("title") or ""
+        title = raw[:40] if isinstance(raw, str) else ""
+        bits.append(f"{cls}: \"{title}\"")
+        failed.append(cls)
+    return "restore: unmatched windows: " + ", ".join(bits)
 
 
 def fmt_age(sec):
@@ -2240,7 +2302,7 @@ class Restorer:
                     # leftovers stay where they opened (the launch workspace)
                     self.claimed.add(c["address"])
                 if g["remaining"]:
-                    self.failed += [f"{g['class']}: \"{w['title'][:40]}\"" for w in g["remaining"]]
+                    log(note_unmatched_windows(self.failed, g["class"], g["remaining"]), echo=True)
                 self.pending.remove(g)
 
     @staticmethod
@@ -2500,7 +2562,13 @@ def restore(args):
         if reason and not args.force:
             log(f"restore: skipped — {reason}", echo=True)
             if reason.startswith("session is stale") and consume and path and os.path.exists(path):
-                notify(cfg, "Session not restored", reason)
+                try:
+                    age_seconds = time.time() - os.stat(path).st_mtime
+                except OSError:
+                    age_seconds = None
+                if age_seconds is not None:
+                    notify_restore(cfg, "stale", age_seconds=age_seconds,
+                                   max_age_hours=cfg["max_age_hours"])
                 try:
                     os.replace(path, os.path.join(RESTORED_DIR, "stale-" + time.strftime("%Y%m%d-%H%M%S") + ".json"))
                 except OSError:
@@ -2542,8 +2610,11 @@ def restore(args):
             f", display_match={sess.get('_display_match')})", echo=True)
         placed, failed = Restorer(cfg).run(sess)
         log(f"restore: done, {placed} windows placed; problems: {failed or 'none'}", echo=True)
-        notify(cfg, f"Restored {placed} of {windows_count(sess)} windows",
-               ("Could not restore: " + ", ".join(failed)) if failed else "")
+        # `failed` may name app classes for the log. It is not notification text:
+        # unmatched titles used to be joined into this body and passed as
+        # notify-send arguments, which other local accounts can read.
+        notify_restore(cfg, "incomplete" if failed else "complete",
+                       placed=placed, total=windows_count(sess))
         return 0
 
 
