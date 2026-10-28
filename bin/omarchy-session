@@ -658,7 +658,16 @@ def cmdline(pid):
             raw = f.read()
     except OSError:
         return []
-    return [a.decode(errors="surrogateescape") for a in raw.split(b"\0") if a != b""] if raw else []
+    if not raw:
+        return []
+    parts = [a.decode(errors="surrogateescape") for a in raw.split(b"\0") if a != b""]
+    # Some Chromium launches leave one concatenated argv string (spaces, no NULs).
+    if len(parts) == 1 and (" --" in parts[0] or parts[0].count(" ") >= 2):
+        try:
+            parts = shlex.split(parts[0])
+        except ValueError:
+            parts = parts[0].split()
+    return parts
 
 
 def exe_of(pid):
@@ -734,9 +743,23 @@ def base(path):
     return os.path.basename(path or "")
 
 
+def strip_deleted(path):
+    """Kernel appends ' (deleted)' when the binary was replaced under a running process."""
+    if path and path.endswith(" (deleted)"):
+        return path[:-10]
+    return path or ""
+
+
 def proc_basename(argv, exe):
-    b = base(argv[0]) if argv else ""
-    return b or base(exe)
+    b = ""
+    if argv:
+        first = argv[0]
+        # Concatenated cmdline blob: "/opt/google/chrome/chrome --type=..."
+        if " --" in first or (first.startswith("/") and " " in first):
+            first = first.split()[0]
+        b = base(first)
+    e = base(strip_deleted(exe))
+    return b or e
 
 
 # --------------------------------------------------------- desktop files --
@@ -1713,16 +1736,39 @@ def with_restore_last_session(argv):
     return list(argv) + ["--restore-last-session"]
 
 
-def chromium_user_data(pbase, pexe, pargv):
+def chromium_user_data(pbase, pexe, pargv, class_hint=""):
     """Absolute Chromium user-data dir for this browser process, or None."""
     for a in pargv or []:
-        if a.startswith("--user-data-dir="):
-            d = os.path.expanduser(a.split("=", 1)[1])
-            return d if os.path.isdir(d) else None
-    for name in (pbase, base(pexe)):
+        candidates = [a]
+        if (" --" in a or a.count(" ") >= 2) and not a.startswith("--user-data-dir="):
+            candidates = a.split()
+        for tok in candidates:
+            if tok.startswith("--user-data-dir="):
+                d = os.path.expanduser(tok.split("=", 1)[1])
+                return d if os.path.isdir(d) else None
+    names = [pbase, base(strip_deleted(pexe)), base(pexe)]
+    if class_hint:
+        names.append(class_hint)
+    cleaned = []
+    for name in names:
+        if not name:
+            continue
+        n = name[:-10] if name.endswith(" (deleted)") else name
+        n = n.split()[0] if " " in n else n
+        cleaned.append(n)
+    for name in cleaned:
         rel = CHROMIUM_USER_DATA.get(name)
         if rel:
             d = os.path.join(XDG_CONFIG, rel)
+            return d if os.path.isdir(d) else None
+    # Last resort when exe/argv were mangled mid-upgrade but the window is Chrome.
+    for name in cleaned:
+        low = name.lower()
+        if "google-chrome" in low or low in ("chrome", "google-chrome-stable"):
+            d = os.path.join(XDG_CONFIG, "google-chrome")
+            return d if os.path.isdir(d) else None
+        if "chromium" in low:
+            d = os.path.join(XDG_CONFIG, "chromium")
             return d if os.path.isdir(d) else None
     return None
 
@@ -1919,14 +1965,23 @@ def snapshot(cfg):
                 else:
                     url = webapp_url_from_argv(pargv)
                     app = m.group("app")
+                    chrome_bin = "google-chrome"
+                    if pargv:
+                        tok = pargv[0].split()[0] if (" " in pargv[0]) else pargv[0]
+                        if tok and " " not in tok:
+                            chrome_bin = tok
+                    elif pexe:
+                        chrome_bin = strip_deleted(pexe) or "google-chrome"
+                    if not chrome_bin or " " in chrome_bin or chrome_bin.endswith(" (deleted)"):
+                        chrome_bin = "google-chrome"
                     if not url and re.fullmatch(r"[a-p]{32}", app):
-                        argv = [pargv[0] if pargv else pexe, f"--app-id={app}"]
+                        argv = [chrome_bin, f"--app-id={app}"]
                         strategy = "installed PWA app id"
                     else:
                         if not url:
                             host, _, path = app.partition("_")
                             url = "https://" + host + "/" + path.replace("_", "/").lstrip("/")
-                        argv = [pargv[0] if pargv else pexe, f"--app={url}"]
+                        argv = [chrome_bin, f"--app={url}"]
                         strategy = "browser --app"
                     prof = m.group("profile")
                     if prof != "Default":
@@ -1945,7 +2000,7 @@ def snapshot(cfg):
                     strategy = "process cmdline"
                 # Strip a stale --profile-directory from the process cmdline; we set it per group.
                 argv = [a for a in argv if not a.startswith("--profile-directory")]
-                ud = chromium_user_data(pbase, base(pexe), pargv)
+                ud = chromium_user_data(pbase, pexe, pargv, class_hint=cls)
                 emails = chromium_profile_emails(ud) if ud else {}
                 title_cache = {}
                 by_prof = {}
@@ -2134,6 +2189,37 @@ def windows_count(sess):
     return sum(len(i["windows"]) for i in sess.get("items", []))
 
 
+def chrome_browser_profiles(sess):
+    """Set of profile names on browser items (empty string if unset)."""
+    out = set()
+    for it in (sess or {}).get("items") or []:
+        if it.get("kind") != "browser":
+            continue
+        cls = (it.get("class") or "").lower()
+        if "chrome" not in cls and "chromium" not in cls:
+            continue
+        out.add(it.get("profile") or "")
+    return out
+
+
+def would_collapse_chrome_profiles(old, new):
+    """True if new would replace split Chrome profiles with a profile='' mega-group."""
+    if not old or not new:
+        return False
+    old_named = {p for p in chrome_browser_profiles(old) if p}
+    new_named = {p for p in chrome_browser_profiles(new) if p}
+    new_all = chrome_browser_profiles(new)
+    if not old_named or new_named:
+        return False
+    if "" not in new_all and not new_all:
+        return False
+    old_n = sum(len(it.get("windows") or []) for it in old.get("items") or []
+                if it.get("kind") == "browser")
+    new_n = sum(len(it.get("windows") or []) for it in new.get("items") or []
+                if it.get("kind") == "browser")
+    return old_n >= 1 and new_n >= 1
+
+
 def save(final=False, reason="manual"):
     cfg = load_config()
     if not cfg["enabled"]:
@@ -2161,6 +2247,18 @@ def save(final=False, reason="manual"):
                 old = json.load(f)
         except (OSError, ValueError):
             pass
+        if old and would_collapse_chrome_profiles(old, sess):
+            log(f"save ({reason}): refusing collapsed Chrome profiles "
+                f"(had {sorted(p for p in chrome_browser_profiles(old) if p)!r}, "
+                f"new {sorted(chrome_browser_profiles(sess))!r}); keeping previous",
+                echo=True)
+            if final:
+                atomic_write(FREEZE, str(time.time() + 120), 0o600)
+                try:
+                    copy_chromium_sessions(old)
+                except Exception as e:
+                    log(f"save: chrome session snapshot failed: {e!r}")
+            return 0
         display = sess.get("display") or display_fingerprint()
         same = (old and old.get("items") == sess["items"] and old.get("instance") == sess["instance"]
                 and (old.get("display") or {}).get("fingerprint") == display.get("fingerprint"))

@@ -217,5 +217,52 @@ class NotifyTests(unittest.TestCase):
         self.assertNotIn("@", summary + body)
 
 
+
+
+class MidUpgradeChromeTests(unittest.TestCase):
+    """artoo 2026-10-28: Chrome upgraded while running collapsed profiles on save."""
+
+    def test_strip_deleted_exe(self):
+        self.assertEqual(m.strip_deleted("/opt/google/chrome/chrome (deleted)"),
+                         "/opt/google/chrome/chrome")
+        self.assertEqual(m.strip_deleted("/opt/google/chrome/chrome"),
+                         "/opt/google/chrome/chrome")
+
+    def test_proc_basename_from_concatenated_argv_and_deleted_exe(self):
+        self.assertEqual(
+            m.proc_basename(
+                ["/opt/google/chrome/chrome --type=zygote --no-zygote-sandbox"],
+                "/opt/google/chrome/chrome (deleted)"),
+            "chrome")
+        self.assertEqual(
+            m.proc_basename([], "/opt/google/chrome/chrome (deleted)"),
+            "chrome")
+
+    def test_chromium_user_data_recovers_from_deleted_exe(self):
+        ud = os.path.join(os.path.expanduser("~"), ".config", "google-chrome")
+        if not os.path.isdir(ud):
+            self.skipTest("no ~/.config/google-chrome on this host")
+        got = m.chromium_user_data(
+            "chrome --type=zygote",
+            "/opt/google/chrome/chrome (deleted)",
+            ["/opt/google/chrome/chrome --type=gpu"],
+            class_hint="google-chrome")
+        self.assertEqual(got, ud)
+
+    def test_save_guard_refuses_collapsed_profiles(self):
+        old = {"items": [
+            {"kind": "browser", "class": "google-chrome", "profile": "Default",
+             "windows": [{"title": "a"}, {"title": "b"}, {"title": "c"}]},
+            {"kind": "browser", "class": "google-chrome", "profile": "Profile 1",
+             "windows": [{"title": "d"}, {"title": "e"}, {"title": "f"}]},
+        ]}
+        collapsed = {"items": [
+            {"kind": "browser", "class": "google-chrome", "profile": "",
+             "windows": [{"title": x} for x in "abcdef"]},
+        ]}
+        self.assertTrue(m.would_collapse_chrome_profiles(old, collapsed))
+        self.assertFalse(m.would_collapse_chrome_profiles(old, old))
+        self.assertFalse(m.would_collapse_chrome_profiles(collapsed, old))
+
 if __name__ == "__main__":
     unittest.main()
