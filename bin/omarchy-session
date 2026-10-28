@@ -43,7 +43,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 FORMAT = 1
 HOME = os.path.expanduser("~")
 XDG_STATE = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state")
@@ -76,7 +76,9 @@ DEFAULTS = {
     "max_login_age_seconds": 900,  # only auto-restore this soon after Hyprland starts
     "save_interval_seconds": 60,
     "event_debounce_seconds": 3,
-    "browser_wait_seconds": 60,
+    "browser_wait_seconds": 150,  # cap while waiting for late browser windows
+    "browser_settle_seconds": 12,  # quiet period before reopening closed browser windows
+    "restore_chromium_session": True,  # after a clean exit, put back the pre-logout Chrome session
     "terminal_wait_seconds": 10,
     "app_wait_seconds": 20,
     "skip_classes": [],            # window classes never saved (regexes, full match)
@@ -177,7 +179,7 @@ def open_lock(path):
 
 
 def ensure_dirs():
-    for d in (STATE_DIR, RESTORED_DIR, LAYOUTS_DIR):
+    for d in (STATE_DIR, RESTORED_DIR, LAYOUTS_DIR, os.path.join(STATE_DIR, "chrome-sessions")):
         os.makedirs(d, mode=0o700, exist_ok=True)
         try:
             os.chmod(d, 0o700)
@@ -318,20 +320,29 @@ def notify_restore(cfg, outcome, placed=0, total=0, age_seconds=0, max_age_hours
     run(["notify-send", "-a", "Session Restore", "-i", "view-restore", summary, body])
 
 
-def note_unmatched_windows(failed, cls, windows):
-    """Log-only description of saved windows that never matched.
+def note_unmatched_windows(failed, cls, windows, notes=None, profile=""):
+    """Log why saved windows never matched.
 
-    Appends one class-name tally per window onto `failed`. Titles are returned
-    in the log line only — `failed` is summarized later and must not carry them
-    into a notification.
+    Appends one class-name tally per window onto `failed`. Titles stay in the
+    mode-600 log: `failed` is summarized later and must not carry them into
+    a notification. Returns a title-free summary suitable for stderr.
     """
-    bits = []
+    by_title = {}
+    for note in notes or []:
+        by_title[note.get("title") or ""] = note
     for w in windows:
         raw = w.get("title") or ""
-        title = raw[:40] if isinstance(raw, str) else ""
-        bits.append(f"{cls}: \"{title}\"")
         failed.append(cls)
-    return "restore: unmatched windows: " + ", ".join(bits)
+        note = by_title.get(raw) or {}
+        best = note.get("best")
+        best_s = f"{best:.2f}" if isinstance(best, float) else "-"
+        log("restore: unmatched "
+            f"class={cls} profile={profile or '-'} workspace={w.get('workspace')} "
+            f"score={best_s} candidates={note.get('candidates', 0)} "
+            f"profile_candidates={note.get('profile_candidates', 0)} "
+            f"title={clip_title(raw)!r} best_title={clip_title(note.get('best_title') or '')!r} "
+            f"best_profile={note.get('best_profile') or '-'}")
+    return f"restore: {len(windows)} {cls} window(s) unmatched (details in session log)"
 
 
 def fmt_age(sec):
@@ -647,7 +658,16 @@ def cmdline(pid):
             raw = f.read()
     except OSError:
         return []
-    return [a.decode(errors="surrogateescape") for a in raw.split(b"\0") if a != b""] if raw else []
+    if not raw:
+        return []
+    parts = [a.decode(errors="surrogateescape") for a in raw.split(b"\0") if a != b""]
+    # Some Chromium launches leave one concatenated argv string (spaces, no NULs).
+    if len(parts) == 1 and (" --" in parts[0] or parts[0].count(" ") >= 2):
+        try:
+            parts = shlex.split(parts[0])
+        except ValueError:
+            parts = parts[0].split()
+    return parts
 
 
 def exe_of(pid):
@@ -723,9 +743,23 @@ def base(path):
     return os.path.basename(path or "")
 
 
+def strip_deleted(path):
+    """Kernel appends ' (deleted)' when the binary was replaced under a running process."""
+    if path and path.endswith(" (deleted)"):
+        return path[:-10]
+    return path or ""
+
+
 def proc_basename(argv, exe):
-    b = base(argv[0]) if argv else ""
-    return b or base(exe)
+    b = ""
+    if argv:
+        first = argv[0]
+        # Concatenated cmdline blob: "/opt/google/chrome/chrome --type=..."
+        if " --" in first or (first.startswith("/") and " " in first):
+            first = first.split()[0]
+        b = base(first)
+    e = base(strip_deleted(exe))
+    return b or e
 
 
 # --------------------------------------------------------- desktop files --
@@ -1294,16 +1328,447 @@ def norm_title(t):
     return t.strip().lower()
 
 
-def chromium_user_data(pbase, pexe, pargv):
+# Browser window titles move while Chrome is restoring: unread counts change,
+# and a window often shows only the site name ("Gmail", "JLCPCB") before the
+# full tab title arrives. Matching uses this key instead of the raw title.
+_BROWSER_SUFFIX_RE = re.compile(
+    r"\s+[-—–]\s+(?:google chrome|chromium|brave|microsoft\s*edge|vivaldi|"
+    r"mozilla firefox|firefox|librewolf|zen browser|helium)$",
+    re.I)
+_UNREAD_RE = re.compile(r"\s*\(\d[\d,]*\)")
+_EMAIL_RE = re.compile(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}")
+_GENERIC_TITLE = {
+    "gmail", "youtube", "google", "google chrome", "chrome", "chromium",
+    "new tab", "inbox", "google search", "untitled",
+}
+_TITLE_ACCEPT = 0.72
+_TITLE_ACCEPT_UNKNOWN_PROFILE = 0.88
+# Different mailboxes share the "Inbox (…) - …" shape. Cap that score under
+# every accept threshold so one profile cannot take the other's window.
+_TITLE_EMAIL_CONFLICT = 0.35
+_SNSS_MAGIC = b"SNSS"
+_SESSION_NAME_RE = re.compile(r"^(Session|Tabs|App)_(\d+)$")
+_CHROME_SESSION_MAX_BYTES = 80_000_000
+_COLUMN_X_SLACK = 80
+
+
+def browser_title_key(title):
+    """Stable comparison key: drop the browser suffix and unread counts."""
+    t = _BROWSER_SUFFIX_RE.sub("", title or "")
+    t = _UNREAD_RE.sub("", t)
+    t = t.replace("—", "-").replace("–", "-")
+    t = re.sub(r"\s+", " ", t).strip(" -").lower()
+    return t
+
+
+def _title_has_token(hay, token):
+    if not token:
+        return False
+    return re.search(r"(^|[^a-z0-9])" + re.escape(token) + r"([^a-z0-9]|$)", hay) is not None
+
+
+def title_similarity(saved, live):
+    """1.0 is the same window. Email conflicts stay below every accept threshold."""
+    a, b = browser_title_key(saved), browser_title_key(live)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    emails_a, emails_b = set(_EMAIL_RE.findall(a)), set(_EMAIL_RE.findall(b))
+    ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    contain = 0.0
+    if shorter not in _GENERIC_TITLE and len(shorter) >= 6 and _title_has_token(longer, shorter):
+        contain = 0.9
+    score = max(ratio, contain)
+    if emails_a and emails_b and emails_a.isdisjoint(emails_b):
+        score = min(score, _TITLE_EMAIL_CONFLICT)
+    return score
+
+
+def only_candidate_match(saved, live):
+    """Last saved window vs last live window, after the strict pass.
+
+    A loading window titled "Gmail" or "JLCPCB" will not clear the strict
+    threshold against the full saved title, but it is safe to take when it is
+    the only window left for this profile.
+    """
+    if title_similarity(saved, live) >= _TITLE_ACCEPT:
+        return True
+    sk, lk = browser_title_key(saved), browser_title_key(live)
+    if not sk or not lk:
+        return False
+    emails_s, emails_l = set(_EMAIL_RE.findall(sk)), set(_EMAIL_RE.findall(lk))
+    if emails_s and emails_l and emails_s.isdisjoint(emails_l):
+        return False
+    if _title_has_token(sk, lk) and len(lk) >= 4:
+        return True
+    return title_similarity(saved, live) >= 0.5
+
+
+def match_saved_windows(saved, clients, profile="", desperate=False):
+    """One-to-one match of saved windows to live clients.
+
+    `profile` excludes clients that belong to another Chromium profile.
+    Clients with an unknown profile need a stronger score so two inboxes
+    cannot cross. Returns (pairs, notes) where pairs are
+    (saved_index, client_index, score) and notes describe still-unmatched
+    saved windows.
+    """
+    threshold = 0.4 if desperate else _TITLE_ACCEPT
+    eligible = []
+    for i, c in enumerate(clients):
+        cp = c.get("profile") or ""
+        if profile and cp and cp != profile:
+            continue
+        eligible.append(i)
+    used_c, used_w = set(), set()
+    scored = []
+    for ci in eligible:
+        cp = clients[ci].get("profile") or ""
+        need = threshold if (not profile or cp == profile) else _TITLE_ACCEPT_UNKNOWN_PROFILE
+        if profile and not cp and not desperate:
+            need = max(need, _TITLE_ACCEPT_UNKNOWN_PROFILE)
+        for wi, w in enumerate(saved):
+            scored.append((title_similarity(w.get("title"), clients[ci].get("title")), ci, wi, need))
+    pairs = []
+    for score, ci, wi, need in sorted(scored, key=lambda row: row[0], reverse=True):
+        if ci in used_c or wi in used_w or score < need:
+            continue
+        used_c.add(ci)
+        used_w.add(wi)
+        pairs.append((wi, ci, score))
+    left_w = [wi for wi in range(len(saved)) if wi not in used_w]
+    left_c = [ci for ci in eligible if ci not in used_c]
+    # One window left: a loading title ("Gmail", "JLCPCB") or the only app window.
+    if len(left_w) == 1 and len(left_c) == 1 and (
+            desperate or only_candidate_match(saved[left_w[0]].get("title"), clients[left_c[0]].get("title"))):
+        wi, ci = left_w[0], left_c[0]
+        used_w.add(wi)
+        used_c.add(ci)
+        pairs.append((wi, ci, title_similarity(saved[wi].get("title"), clients[ci].get("title"))))
+    notes = []
+    for wi, w in enumerate(saved):
+        if wi in used_w:
+            continue
+        best_s, best_t, best_p = 0.0, "", ""
+        for c in clients:
+            s = title_similarity(w.get("title"), c.get("title"))
+            if s >= best_s:
+                best_s, best_t, best_p = s, c.get("title") or "", c.get("profile") or ""
+        notes.append({
+            "title": w.get("title") or "",
+            "workspace": w.get("workspace"),
+            "best": best_s,
+            "best_title": best_t,
+            "best_profile": best_p,
+            "candidates": len(clients),
+            "profile_candidates": len(eligible),
+        })
+    return pairs, notes
+
+
+def leftover_claim_ids(group_profile, group_class, other_group_waiting, clients):
+    """Addresses a finished match group may claim.
+
+    Another pending group of the same class must be able to see windows that
+    are not known to belong to this profile. Claiming them early is what left
+    every Chrome window on the launch workspace.
+    """
+    claim = []
+    for c in clients:
+        if (c.get("class") or "") != group_class:
+            continue
+        cp = c.get("profile") or ""
+        if group_profile and cp and cp != group_profile:
+            continue
+        if not cp and other_group_waiting:
+            continue
+        addr = c.get("address")
+        if addr:
+            claim.append(addr)
+    return claim
+
+
+def clip_title(title, n=80):
+    title = title or ""
+    return title if len(title) <= n else title[:n]
+
+
+def column_groups(ids_and_x, slack=_COLUMN_X_SLACK):
+    """Group (id, x) pairs that share a scrolling column (nearly the same x)."""
+    groups = []
+    for item in sorted(ids_and_x, key=lambda t: t[1]):
+        if groups and abs(item[1] - groups[-1][0][1]) <= slack:
+            groups[-1].append(item)
+        else:
+            groups.append([item])
+    return groups
+
+
+def inversion_index(actual_ids, desired_ids):
+    """First adjacent pair that is out of desired order, or None."""
+    rank = {a: i for i, a in enumerate(desired_ids)}
+    for i in range(len(actual_ids) - 1):
+        if rank.get(actual_ids[i], 0) > rank.get(actual_ids[i + 1], 0):
+            return i
+    return None
+
+
+def snss_header_ok(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == _SNSS_MAGIC
+    except OSError:
+        return False
+
+
+def newest_snss(directory, prefix):
+    """Newest Session_/Tabs_ file that still has Chromium's SNSS header."""
+    if not directory or not os.path.isdir(directory):
+        return None
+    found = []
+    for name in os.listdir(directory):
+        m = re.match(rf"^{re.escape(prefix)}_(\d+)$", name)
+        if not m:
+            continue
+        path = os.path.join(directory, name)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        if 8 <= size <= _CHROME_SESSION_MAX_BYTES and snss_header_ok(path):
+            found.append((int(m.group(1)), path))
+    if not found:
+        return None
+    found.sort()
+    return found[-1][1]
+
+
+def next_session_stamp(names):
+    stamps = []
+    for name in names:
+        m = _SESSION_NAME_RE.match(name)
+        if m:
+            stamps.append(int(m.group(2)))
+    return (max(stamps) if stamps else 0) + 1
+
+
+def chrome_sidecar_dir(user_data, profile):
+    key = hashlib.sha256(f"{os.path.realpath(user_data)}\0{profile}".encode()).hexdigest()[:16]
+    return os.path.join(STATE_DIR, "chrome-sessions", key)
+
+
+def chromium_clean_exit(user_data, profile):
+    """True only when Chrome itself recorded a clean quit.
+
+    A clean quit is the bad case for multi-window restore: Hyprland closes
+    each window, Chrome appends a close to its session, and the next launch
+    reopens only the last window. A crash leaves the full session in place,
+    so that file must not be replaced.
+    """
+    path = os.path.join(user_data, profile, "Preferences")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            prefs = json.load(f)
+    except (OSError, ValueError):
+        return None
+    prof = prefs.get("profile") if isinstance(prefs, dict) else None
+    if not isinstance(prof, dict):
+        return None
+    if prof.get("exit_type") == "Normal" and prof.get("exited_cleanly") is True:
+        return True
+    return False
+
+
+def _copy_private(src, dest):
+    parent = os.path.dirname(dest)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(parent, 0o700)
+    except OSError:
+        pass
+    fd, tmp = tempfile.mkstemp(dir=parent, prefix=".session.")
+    try:
+        with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
+            size = os.fstat(inp.fileno()).st_size
+            if size < 8 or size > _CHROME_SESSION_MAX_BYTES:
+                raise OSError("session file size out of range")
+            data = inp.read(size)
+        if not data.startswith(_SNSS_MAGIC):
+            raise OSError("not an SNSS session file")
+        with open(tmp, "wb") as out:
+            out.write(data)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return len(data) if isinstance(data, (bytes, bytearray)) else 0
+
+
+def copy_chromium_sessions(sess):
+    """Copy each Chromium profile's current session next to our snapshot.
+
+    Called when the window list changes and on the final pre-logout save.
+    The copy is what restore puts back after a clean exit.
+    """
+    seen = set()
+    for it in sess.get("items") or []:
+        if it.get("kind") != "browser":
+            continue
+        prof = it.get("profile") or ""
+        argv = it.get("argv") or []
+        if not prof or not argv:
+            continue
+        ud = chromium_user_data(base(argv[0]), "", argv)
+        if not ud:
+            continue
+        key = (os.path.realpath(ud), prof)
+        if key in seen:
+            continue
+        seen.add(key)
+        src_dir = os.path.join(ud, prof, "Sessions")
+        session_src, tabs_src = newest_snss(src_dir, "Session"), newest_snss(src_dir, "Tabs")
+        if not session_src or not tabs_src:
+            log(f"save: no chrome session files to snapshot for profile {prof}")
+            continue
+        dest = chrome_sidecar_dir(ud, prof)
+        try:
+            n1 = _copy_private(session_src, os.path.join(dest, "Session"))
+            n2 = _copy_private(tabs_src, os.path.join(dest, "Tabs"))
+        except OSError as e:
+            log(f"save: chrome session snapshot failed for profile {prof}: {e}")
+            continue
+        log(f"save: chrome session snapshot profile={prof} session_bytes={n1} tabs_bytes={n2}")
+
+
+def install_chromium_session(user_data, profile, running=False, enabled=True):
+    """Install the pre-logout session as Chromium's newest session files.
+
+    Returns (installed, reason). Does nothing when Chrome crashed (its own
+    file still has every window) or when that profile is already running.
+    """
+    if not enabled:
+        return False, "disabled"
+    if not user_data or not profile:
+        return False, "no-profile"
+    if running:
+        return False, "already-running"
+    clean = chromium_clean_exit(user_data, profile)
+    if clean is not True:
+        return False, "clean-exit" if clean is False else "exit-unknown"
+    src = chrome_sidecar_dir(user_data, profile)
+    session_src, tabs_src = os.path.join(src, "Session"), os.path.join(src, "Tabs")
+    if not (snss_header_ok(session_src) and snss_header_ok(tabs_src)):
+        return False, "no-snapshot"
+    dest_dir = os.path.join(user_data, profile, "Sessions")
+    try:
+        os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+        names = os.listdir(dest_dir)
+        stamp = next_session_stamp(names)
+        session_dest = os.path.join(dest_dir, f"Session_{stamp}")
+        tabs_dest = os.path.join(dest_dir, f"Tabs_{stamp}")
+        try:
+            _copy_private(session_src, session_dest)
+            _copy_private(tabs_src, tabs_dest)
+        except OSError:
+            for path in (session_dest, tabs_dest):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            raise
+    except OSError as e:
+        log(f"restore: chrome session install failed for profile {profile}: {e}")
+        return False, "install-failed"
+    log(f"restore: installed chrome session snapshot for profile {profile} (stamp {stamp})")
+    return True, "installed"
+
+
+def chromium_profile_is_running(user_data, profile):
+    """True when a Chromium browser process for this profile is already up."""
+    try:
+        want = os.path.realpath(user_data)
+    except OSError:
+        return False
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return False
+    for pid in entries:
+        if not pid.isdigit():
+            continue
+        argv = cmdline(pid)
+        if not argv or any(a.startswith("--type=") for a in argv):
+            continue
+        b = base(argv[0])
+        if b not in CHROMIUM_USER_DATA:
+            continue
+        ud = chromium_user_data(b, "", argv)
+        if not ud:
+            continue
+        try:
+            if os.path.realpath(ud) != want:
+                continue
+        except OSError:
+            continue
+        got = None
+        for a in argv:
+            if a.startswith("--profile-directory="):
+                got = a.split("=", 1)[1]
+                break
+        if got == profile or (got is None and profile == "Default"):
+            return True
+    return False
+
+
+def with_restore_last_session(argv):
+    """Ask Chromium to restore its session even if the startup pref would not."""
+    if any(a == "--restore-last-session" or a.startswith("--restore-last-session=") for a in argv):
+        return list(argv)
+    b = base(argv[0]) if argv else ""
+    if b not in CHROMIUM_USER_DATA:
+        return list(argv)
+    return list(argv) + ["--restore-last-session"]
+
+
+def chromium_user_data(pbase, pexe, pargv, class_hint=""):
     """Absolute Chromium user-data dir for this browser process, or None."""
     for a in pargv or []:
-        if a.startswith("--user-data-dir="):
-            d = os.path.expanduser(a.split("=", 1)[1])
-            return d if os.path.isdir(d) else None
-    for name in (pbase, base(pexe)):
+        candidates = [a]
+        if (" --" in a or a.count(" ") >= 2) and not a.startswith("--user-data-dir="):
+            candidates = a.split()
+        for tok in candidates:
+            if tok.startswith("--user-data-dir="):
+                d = os.path.expanduser(tok.split("=", 1)[1])
+                return d if os.path.isdir(d) else None
+    names = [pbase, base(strip_deleted(pexe)), base(pexe)]
+    if class_hint:
+        names.append(class_hint)
+    cleaned = []
+    for name in names:
+        if not name:
+            continue
+        n = name[:-10] if name.endswith(" (deleted)") else name
+        n = n.split()[0] if " " in n else n
+        cleaned.append(n)
+    for name in cleaned:
         rel = CHROMIUM_USER_DATA.get(name)
         if rel:
             d = os.path.join(XDG_CONFIG, rel)
+            return d if os.path.isdir(d) else None
+    # Last resort when exe/argv were mangled mid-upgrade but the window is Chrome.
+    for name in cleaned:
+        low = name.lower()
+        if "google-chrome" in low or low in ("chrome", "google-chrome-stable"):
+            d = os.path.join(XDG_CONFIG, "google-chrome")
+            return d if os.path.isdir(d) else None
+        if "chromium" in low:
+            d = os.path.join(XDG_CONFIG, "chromium")
             return d if os.path.isdir(d) else None
     return None
 
@@ -1500,14 +1965,23 @@ def snapshot(cfg):
                 else:
                     url = webapp_url_from_argv(pargv)
                     app = m.group("app")
+                    chrome_bin = "google-chrome"
+                    if pargv:
+                        tok = pargv[0].split()[0] if (" " in pargv[0]) else pargv[0]
+                        if tok and " " not in tok:
+                            chrome_bin = tok
+                    elif pexe:
+                        chrome_bin = strip_deleted(pexe) or "google-chrome"
+                    if not chrome_bin or " " in chrome_bin or chrome_bin.endswith(" (deleted)"):
+                        chrome_bin = "google-chrome"
                     if not url and re.fullmatch(r"[a-p]{32}", app):
-                        argv = [pargv[0] if pargv else pexe, f"--app-id={app}"]
+                        argv = [chrome_bin, f"--app-id={app}"]
                         strategy = "installed PWA app id"
                     else:
                         if not url:
                             host, _, path = app.partition("_")
                             url = "https://" + host + "/" + path.replace("_", "/").lstrip("/")
-                        argv = [pargv[0] if pargv else pexe, f"--app={url}"]
+                        argv = [chrome_bin, f"--app={url}"]
                         strategy = "browser --app"
                     prof = m.group("profile")
                     if prof != "Default":
@@ -1526,7 +2000,7 @@ def snapshot(cfg):
                     strategy = "process cmdline"
                 # Strip a stale --profile-directory from the process cmdline; we set it per group.
                 argv = [a for a in argv if not a.startswith("--profile-directory")]
-                ud = chromium_user_data(pbase, base(pexe), pargv)
+                ud = chromium_user_data(pbase, pexe, pargv, class_hint=cls)
                 emails = chromium_profile_emails(ud) if ud else {}
                 title_cache = {}
                 by_prof = {}
@@ -1715,6 +2189,37 @@ def windows_count(sess):
     return sum(len(i["windows"]) for i in sess.get("items", []))
 
 
+def chrome_browser_profiles(sess):
+    """Set of profile names on browser items (empty string if unset)."""
+    out = set()
+    for it in (sess or {}).get("items") or []:
+        if it.get("kind") != "browser":
+            continue
+        cls = (it.get("class") or "").lower()
+        if "chrome" not in cls and "chromium" not in cls:
+            continue
+        out.add(it.get("profile") or "")
+    return out
+
+
+def would_collapse_chrome_profiles(old, new):
+    """True if new would replace split Chrome profiles with a profile='' mega-group."""
+    if not old or not new:
+        return False
+    old_named = {p for p in chrome_browser_profiles(old) if p}
+    new_named = {p for p in chrome_browser_profiles(new) if p}
+    new_all = chrome_browser_profiles(new)
+    if not old_named or new_named:
+        return False
+    if "" not in new_all and not new_all:
+        return False
+    old_n = sum(len(it.get("windows") or []) for it in old.get("items") or []
+                if it.get("kind") == "browser")
+    new_n = sum(len(it.get("windows") or []) for it in new.get("items") or []
+                if it.get("kind") == "browser")
+    return old_n >= 1 and new_n >= 1
+
+
 def save(final=False, reason="manual"):
     cfg = load_config()
     if not cfg["enabled"]:
@@ -1742,6 +2247,18 @@ def save(final=False, reason="manual"):
                 old = json.load(f)
         except (OSError, ValueError):
             pass
+        if old and would_collapse_chrome_profiles(old, sess):
+            log(f"save ({reason}): refusing collapsed Chrome profiles "
+                f"(had {sorted(p for p in chrome_browser_profiles(old) if p)!r}, "
+                f"new {sorted(chrome_browser_profiles(sess))!r}); keeping previous",
+                echo=True)
+            if final:
+                atomic_write(FREEZE, str(time.time() + 120), 0o600)
+                try:
+                    copy_chromium_sessions(old)
+                except Exception as e:
+                    log(f"save: chrome session snapshot failed: {e!r}")
+            return 0
         display = sess.get("display") or display_fingerprint()
         same = (old and old.get("items") == sess["items"] and old.get("instance") == sess["instance"]
                 and (old.get("display") or {}).get("fingerprint") == display.get("fingerprint"))
@@ -1762,6 +2279,15 @@ def save(final=False, reason="manual"):
             remember_current_display(display)
         if final:
             atomic_write(FREEZE, str(time.time() + 120), 0o600)
+        # Snapshot Chromium's own session on every real write, and always on
+        # the final pre-logout save (even when the window list did not change).
+        # That file still lists every window; Chrome's copy will not, once
+        # logout closes the windows one by one.
+        if final or not same:
+            try:
+                copy_chromium_sessions(sess)
+            except Exception as e:
+                log(f"save: chrome session snapshot failed: {e!r}")
         log(f"save ({reason}{', final' if final else ''}): {n} windows, {msg}", echo=not QUIET and reason == "manual")
         return 0
 
@@ -2122,6 +2648,11 @@ def print_plan(sess):
             for w in it["windows"]:
                 print(f"     ws {ws_selector(w):>3}  {'floating ' if w['floating'] else ''}\"{w['title'][:70]}\"")
             print("     (skipped only if this profile's windows are already open)")
+            if prof and it.get("argv"):
+                ud = chromium_user_data(base(it["argv"][0]), "", it["argv"])
+                side = chrome_sidecar_dir(ud, prof) if ud else ""
+                if side and os.path.isfile(os.path.join(side, "Session")):
+                    print("     a clean exit restores this profile from the pre-logout Chrome session snapshot")
         else:
             w = it["windows"][0]
             extra = ""
@@ -2179,11 +2710,9 @@ def relayout_existing(sess, cfg=None):
                      and (c.get("class") or c.get("initialClass") or "").lower() == cls.lower()]
             if not cands:
                 continue
-            best = max(cands, key=lambda c: difflib.SequenceMatcher(
-                None, norm_title(c.get("title")), norm_title(w.get("title"))).ratio())
-            score = difflib.SequenceMatcher(
-                None, norm_title(best.get("title")), norm_title(w.get("title"))).ratio()
-            if score < 0.4 and len(cands) > 1:
+            best = max(cands, key=lambda c: title_similarity(w.get("title"), c.get("title")))
+            score = title_similarity(w.get("title"), best.get("title"))
+            if score < _TITLE_ACCEPT and not (len(cands) == 1 and only_candidate_match(w.get("title"), best.get("title"))):
                 continue
             r.place(best, w)
             placed += 1
@@ -2205,6 +2734,8 @@ class Restorer:
         self.pending = []   # browser/app groups waiting for more windows
         self.placed = 0
         self.failed = []
+        self.placed_at = {}    # address → saved window, for layout rebuild
+        self._prof_cache = {}
         self.hooked = hook_installed()
         self.refocus = None
         try:
@@ -2242,6 +2773,7 @@ class Restorer:
         self.claimed.add(c["address"])
         monitors_now = getattr(self, "monitors_now", None) or hypr_json("monitors")
         w = clamp_floating(w, monitors_now, (getattr(self, "sess", {}) or {}).get("monitors") or [])
+        self.placed_at[c["address"]] = w
         mid = w.get("monitor_identity") or w.get("monitor_name")
         mon_name = resolve_monitor_name(mid, monitors_now)
         wid = w.get("workspace")
@@ -2253,21 +2785,188 @@ class Restorer:
                         break
             except Exception:
                 pass
-        ws = ws_selector(w)
-        cur = c.get("workspace") or {}
-        if ws_selector({"workspace": cur.get("id"), "ws_name": cur.get("name", "")}) != ws:
-            dispatch(f"hl.dsp.window.move({{ workspace = {L(ws)}, follow = false, window = {L(addr)} }})")
-        if bool(c.get("floating")) != bool(w.get("floating")):
+        cls = c.get("class") or c.get("initialClass") or "?"
+        if not self._move_to_workspace(c, w, cls):
+            # Count it so the notification says the restore was incomplete.
+            # The class name is not a window title.
+            self.failed.append(cls)
+        fresh = self._client(c["address"]) or c
+        if bool(fresh.get("floating")) != bool(w.get("floating")):
             dispatch(f"hl.dsp.window.float({{ action = {L('on' if w['floating'] else 'off')}, window = {L(addr)} }})")
         if w.get("floating") and w.get("size") and w.get("at"):
             dispatch(f"hl.dsp.window.resize({{ x = {int(w['size'][0])}, y = {int(w['size'][1])}, window = {L(addr)} }})")
             dispatch(f"hl.dsp.window.move({{ x = {int(w['at'][0])}, y = {int(w['at'][1])}, window = {L(addr)} }})")
-        if w.get("fullscreen") and not c.get("fullscreen"):
+        if w.get("fullscreen") and not fresh.get("fullscreen"):
             mode = "maximized" if w["fullscreen"] == 1 else "fullscreen"
             dispatch(f"hl.dsp.window.fullscreen({{ mode = {L(mode)}, window = {L(addr)} }})")
-        if w.get("pinned") and w.get("floating") and not c.get("pinned"):
+        if w.get("pinned") and w.get("floating") and not fresh.get("pinned"):
             dispatch(f"hl.dsp.window.pin({{ window = {L(addr)} }})")
         self.placed += 1
+
+    def _client(self, address):
+        for c in self.clients():
+            if c.get("address") == address:
+                return c
+        return None
+
+    def _client_ws(self, c):
+        cur = (c or {}).get("workspace") or {}
+        return ws_selector({"workspace": cur.get("id"), "ws_name": cur.get("name", "")})
+
+    def _layout(self, ws_id):
+        """Live layout name for a workspace id, else the saved one."""
+        try:
+            for ws in hypr_json("workspaces"):
+                if ws.get("id") == ws_id and ws.get("tiledLayout"):
+                    return str(ws.get("tiledLayout")).lower()
+        except Exception:
+            pass
+        for ws in (getattr(self, "sess", None) or {}).get("workspaces") or []:
+            if ws.get("id") == ws_id:
+                return str(ws.get("tiledLayout") or "").lower()
+        return ""
+
+    def _focus(self, address):
+        self.refocus = True
+        return dispatch(f"hl.dsp.focus({{ window = {lua_long('address:' + address)} }})")
+
+    def _layout_msg(self, message):
+        return dispatch(f"hl.dsp.layout({lua_long(message)})")
+
+    def _move_to_workspace(self, c, w, cls):
+        """Move one window onto its saved workspace and check that it stuck.
+
+        On the scrolling layout a column can contain several windows. Moving
+        the column would drag the others along and pile every window onto the
+        last workspace, so a shared column is split before the move.
+        """
+        target = ws_selector(w)
+        addr = c["address"]
+        cur_c = self._client(addr) or c
+        current = self._client_ws(cur_c)
+        if current == target:
+            log(f"restore: workspace keep class={cls} addr={addr} workspace={target}")
+            return True
+        ws_id = (cur_c.get("workspace") or {}).get("id")
+        layout = self._layout(ws_id) if isinstance(ws_id, int) else ""
+        if layout == "scrolling":
+            self._split_scrolling_column(addr, cls)
+        log(f"restore: workspace move class={cls} addr={addr} {current} -> {target} via window.move")
+        sel = lua_long("address:" + addr)
+        dispatch(f"hl.dsp.window.move({{ workspace = {lua_long(target)}, follow = false, window = {sel} }})")
+        now = self._client(addr)
+        got = self._client_ws(now) if now else ""
+        if got == target:
+            log(f"restore: workspace move class={cls} addr={addr} now on {got}")
+            return True
+        log(f"restore: workspace move class={cls} addr={addr} still on {got or '?'}; retrying focused")
+        self._focus(addr)
+        dispatch(f"hl.dsp.window.move({{ workspace = {lua_long(target)}, follow = false, window = {sel} }})")
+        now = self._client(addr)
+        got = self._client_ws(now) if now else ""
+        if got == target:
+            log(f"restore: workspace move class={cls} addr={addr} now on {got} after focus")
+            return True
+        # Last resort when this window is already alone in its scrolling column.
+        # movecoltoworkspace moves the whole column; using it on a shared column
+        # would drag the other windows onto this workspace and pile them up.
+        now_layout = self._layout((now.get("workspace") or {}).get("id")) if now else layout
+        if now_layout == "scrolling" or layout == "scrolling":
+            if self._alone_in_column(addr):
+                self._focus(addr)
+                self._layout_msg("movecoltoworkspace " + target)
+                now = self._client(addr)
+                got = self._client_ws(now) if now else ""
+                if got == target:
+                    log(f"restore: workspace move class={cls} addr={addr} now on {got} via movecoltoworkspace")
+                    return True
+            else:
+                log(f"restore: workspace move class={cls} addr={addr} skipped movecoltoworkspace "
+                    "(other windows share its column)")
+        live_layout = self._layout((now.get("workspace") or {}).get("id")) if now else layout
+        log(f"restore: workspace move FAILED class={cls} addr={addr} wanted {target} still {got or '?'} layout={live_layout or layout or '?'}")
+        return False
+
+    def _alone_in_column(self, address):
+        me = self._client(address)
+        if not me:
+            return False
+        ws_id = (me.get("workspace") or {}).get("id")
+        if self._layout(ws_id) != "scrolling":
+            return False
+        x = (me.get("at") or [0])[0]
+        for c in self.clients():
+            if c.get("address") == address or c.get("floating"):
+                continue
+            if (c.get("workspace") or {}).get("id") != ws_id:
+                continue
+            if abs(((c.get("at") or [0])[0]) - x) <= _COLUMN_X_SLACK:
+                return False
+        return True
+
+    def _split_scrolling_column(self, address, cls):
+        """Give this window its own scrolling column when it shares one."""
+        for _ in range(6):
+            me = self._client(address)
+            if not me or me.get("floating"):
+                return
+            ws_id = (me.get("workspace") or {}).get("id")
+            if self._layout(ws_id) != "scrolling":
+                return
+            x = (me.get("at") or [0])[0]
+            mates = []
+            for c in self.clients():
+                if c.get("address") == address or c.get("floating"):
+                    continue
+                if (c.get("workspace") or {}).get("id") != ws_id:
+                    continue
+                if abs(((c.get("at") or [0])[0]) - x) <= _COLUMN_X_SLACK:
+                    mates.append(c["address"])
+            if not mates:
+                return
+            before = x
+            self._focus(address)
+            self._layout_msg("promote")
+            time.sleep(0.05)
+            me = self._client(address)
+            nx = ((me or {}).get("at") or [0])[0]
+            if abs(nx - before) > _COLUMN_X_SLACK:
+                log(f"restore: split scrolling column class={cls} addr={address} via promote")
+                continue
+            self._layout_msg("expel")
+            time.sleep(0.05)
+            me = self._client(address)
+            nx = ((me or {}).get("at") or [0])[0]
+            if abs(nx - before) > _COLUMN_X_SLACK:
+                log(f"restore: split scrolling column class={cls} addr={address} via expel")
+                continue
+            log(f"restore: could not split scrolling column class={cls} addr={address} shared_with={len(mates)}")
+            return
+
+    def _profile_of_client(self, c):
+        pid = c.get("pid") or 0
+        if not pid:
+            return ""
+        if pid in self._prof_cache:
+            return self._prof_cache[pid]
+        mp = main_process(pid)
+        prof = ""
+        for a in cmdline(mp):
+            if a.startswith("--profile-directory="):
+                prof = a.split("=", 1)[1]
+                break
+        self._prof_cache[pid] = prof
+        self._prof_cache[mp] = prof
+        return prof
+
+    def _match_client(self, c):
+        return {
+            "address": c.get("address"),
+            "title": c.get("title") or "",
+            "profile": self._profile_of_client(c),
+            "class": c.get("class") or c.get("initialClass") or "",
+            "raw": c,
+        }
 
     def wait_new(self, cls, timeout):
         end = time.time() + timeout
@@ -2280,110 +2979,256 @@ class Restorer:
         return None
 
     def step_pending(self, final):
+        progressed = False
         for g in list(self.pending):
-            cands = self.unclaimed(g["class"])
+            raw = self.unclaimed(g["class"])
+            cands = [self._match_client(c) for c in raw]
             remaining = g["remaining"]
-            done = time.time() > g["deadline"] or final
+            browser = g.get("kind") == "browser"
+            done = time.time() > g.get("deadline", 0) or final
             if cands and remaining:
-                pairs = sorted(((difflib.SequenceMatcher(None, norm_title(c["title"]), norm_title(w["title"])).ratio(), ci, wi)
-                                for ci, c in enumerate(cands) for wi, w in enumerate(remaining)), reverse=True)
-                used_c, used_w = set(), set()
-                for score, ci, wi in pairs:
-                    if ci in used_c or wi in used_w:
-                        continue
-                    if score >= 0.8 or (done and score >= 0.4) or (done and len(remaining) == 1 and len(cands) == 1):
-                        self.place(cands[ci], remaining[wi])
-                        g.setdefault("placed", []).append((cands[ci]["address"], remaining[wi]))
-                        used_c.add(ci)
-                        used_w.add(wi)
-                g["remaining"] = [w for wi, w in enumerate(remaining) if wi not in used_w]
-            if not g["remaining"] or done:
-                for c in self.unclaimed(g["class"]):
-                    # leftovers stay where they opened (the launch workspace)
-                    self.claimed.add(c["address"])
-                if g["remaining"]:
-                    log(note_unmatched_windows(self.failed, g["class"], g["remaining"]), echo=True)
-                self.pending.remove(g)
+                pairs, notes = match_saved_windows(
+                    remaining, cands, g.get("profile") or "", desperate=done and not browser)
+                g["last_notes"] = notes
+                matched = {wi for wi, _, _ in pairs}
+                for wi, ci, score in pairs:
+                    self.place(cands[ci]["raw"], remaining[wi])
+                    progressed = True
+                    log(f"restore: matched class={g['class']} profile={g.get('profile') or '-'} "
+                        f"score={score:.2f} workspace={ws_selector(remaining[wi])} "
+                        f"title={clip_title(remaining[wi].get('title'))!r}")
+                g["remaining"] = [w for wi, w in enumerate(remaining) if wi not in matched]
+            if g["remaining"] and not done:
+                continue
+            self._claim_group_leftovers(g)
+            if g["remaining"]:
+                summary = note_unmatched_windows(
+                    self.failed, g["class"], g["remaining"], g.get("last_notes"), g.get("profile") or "")
+                log(summary, echo=True)
+            self.pending.remove(g)
+        return progressed
 
-    @staticmethod
-    def _titles_covered(clients, wins):
-        """True when every saved window title fuzzy-matches some live client."""
-        if not wins:
-            return True
-        if len(clients) < len(wins):
+    def _claim_group_leftovers(self, g):
+        # Do not swallow windows another profile's group still needs to place.
+        others = any(
+            p is not g and p.get("class") == g.get("class") and p.get("remaining")
+            for p in self.pending)
+        clients = [self._match_client(c) for c in self.unclaimed(g["class"])]
+        for addr in leftover_claim_ids(g.get("profile") or "", g["class"], others, clients):
+            self.claimed.add(addr)
+
+    def _reopen_closed_window(self, g):
+        """Ctrl+Shift+T — Chrome's reopen-closed-window shortcut — once.
+
+        This is the same action as History → recently closed. It runs only
+        after new windows have stopped appearing, and only for still-missing
+        saved windows. Stops if the key does not create a new toplevel, so a
+        restored tab is not pulled into a window we already placed.
+        """
+        if g.get("reopen_stop"):
             return False
-        used = set()
-        for w in wins:
-            best_i, best = -1, 0.0
-            for i, c in enumerate(clients):
-                if i in used:
-                    continue
-                r = difflib.SequenceMatcher(None, norm_title(c["title"]), norm_title(w["title"])).ratio()
-                if r > best:
-                    best, best_i = r, i
-            if best < 0.8:
-                return False
-            used.add(best_i)
-        return True
+        target = None
+        for c in self.clients():
+            if (c.get("class") or c.get("initialClass") or "").lower() != (g.get("class") or "").lower():
+                continue
+            cp = self._profile_of_client(c)
+            if g.get("profile") and cp and cp != g["profile"]:
+                continue
+            target = c
+            if g.get("profile") and cp == g["profile"]:
+                break
+        if not target:
+            log(f"restore: reopen skipped class={g.get('class')} profile={g.get('profile') or '-'} "
+                "(no window of this profile to send the shortcut to)")
+            g["reopen_stop"] = True
+            return False
+        before = {c.get("address") for c in self.clients()}
+        self._focus(target["address"])
+        addr = lua_long("address:" + target["address"])
+        dispatch(f"hl.dsp.send_shortcut({{ mods = {lua_long('CTRL SHIFT')}, key = {lua_long('T')}, window = {addr} }})")
+        log(f"restore: reopen closed window class={g.get('class')} profile={g.get('profile') or '-'} "
+            f"attempt={g.get('reopen_attempts', 0) + 1} missing={len(g.get('remaining') or [])}")
+        end = time.time() + 3
+        while time.time() < end:
+            time.sleep(0.25)
+            new = [c for c in self.clients()
+                   if c.get("address") not in before
+                   and (c.get("class") or c.get("initialClass") or "").lower() == (g.get("class") or "").lower()]
+            if new:
+                return True
+        log(f"restore: reopen produced no new {g.get('class')} window for profile {g.get('profile') or '-'}; stopping")
+        g["reopen_stop"] = True
+        return False
+
+    def _extend_browser_deadlines(self):
+        """Keep waiting while Chrome is still creating windows, up to the cap."""
+        now = time.time()
+        settle = max(1, int(self.cfg.get("browser_settle_seconds", 12)))
+        for g in self.pending:
+            if g.get("kind") != "browser":
+                continue
+            cap = g.get("deadline_cap", g.get("deadline", now))
+            g["deadline"] = min(cap, max(g.get("deadline", now), now + settle))
+
+    def wait_pending(self):
+        settle = max(1, int(self.cfg.get("browser_settle_seconds", 12)))
+        last_addrs = {c.get("address") for c in self.clients()}
+        last_change = time.time()
+        while self.pending:
+            self.step_pending(final=False)
+            if not self.pending:
+                break
+            addrs = {c.get("address") for c in self.clients()}
+            if addrs != last_addrs:
+                last_change = time.time()
+                last_addrs = addrs
+                self._extend_browser_deadlines()
+            elif time.time() - last_change >= settle:
+                for g in list(self.pending):
+                    if g.get("kind") != "browser" or g.get("reopen_stop"):
+                        continue
+                    if time.time() <= g.get("reopen_after", 0) or time.time() > g.get("deadline", 0):
+                        continue
+                    if g.get("reopen_attempts", 0) >= g.get("reopen_budget", 0):
+                        g["reopen_stop"] = True
+                        continue
+                    if not g.get("remaining"):
+                        continue
+                    opened = self._reopen_closed_window(g)
+                    g["reopen_attempts"] = g.get("reopen_attempts", 0) + 1
+                    if opened:
+                        last_change = time.time()
+                        last_addrs = {c.get("address") for c in self.clients()}
+                    break
+            time.sleep(0.4)
+
+    def _live_xs(self, addrs):
+        out = {}
+        live = {c["address"]: c for c in self.clients()}
+        for a in addrs:
+            c = live.get(a) or {}
+            at = c.get("at") or [0]
+            out[a] = at[0] if at else 0
+        return out
+
+    def _order_is_spread(self, desired):
+        """True when left-to-right x order matches `desired` and columns are distinct."""
+        xs = self._live_xs(desired)
+        # Lexicographic address order as the tie input, so equal x values do not
+        # look "already sorted" just because Python's sort is stable.
+        actual = sorted(desired, key=lambda a: (xs.get(a, 0), a))
+        if actual != desired and inversion_index(actual, desired) is not None:
+            return False
+        if actual != desired:
+            return False
+        ordered = sorted(xs.get(a, 0) for a in desired)
+        return all(ordered[i + 1] - ordered[i] > _COLUMN_X_SLACK for i in range(len(ordered) - 1))
 
     def reorder_tiled(self, sess):
-        """For tiled windows sharing a workspace, swap until left-to-right matches saved at[0].
+        """Put tiled windows left to right in saved order.
 
-        Chrome (and other multi-window apps) often reopen windows in an order that
-        leaves two side-by-side windows swapped. Floating windows already get exact
-        x/y from place(); this only touches tiled ones."""
-        # Build address → saved window for everything we placed via pending
-        saved_by_addr = {}
-        # Re-read live clients once
-        live = {c["address"]: c for c in hypr_json("clients")}
-        # Use current positions of windows that match saved titles on each workspace
+        Directional ``window.swap`` (swap right) is not used. On the scrolling
+        layout Hyprland answers "No window to swap with in that direction" and
+        a bubble-sort retries that same swap until it gives up, leaving the
+        windows stacked in one column. Scrolling windows are split into their
+        own columns and ordered with ``swapcol``. Other layouts swap the two
+        specific windows that are out of order.
+        """
+        del sess  # order comes from windows place() actually moved
+        live = {c["address"]: c for c in self.clients()}
         by_ws = {}
-        for it in sess.get("items") or []:
-            if it.get("kind") not in ("browser", "app", "webapp"):
+        for addr, saved in self.placed_at.items():
+            if not isinstance(saved, dict) or saved.get("floating") or not saved.get("at"):
                 continue
-            for w in it.get("windows") or []:
-                if w.get("floating") or not w.get("at"):
-                    continue
-                # find live client with best title match on that workspace, unclaimed-or-any
-                ws = w.get("workspace")
-                candidates = [c for c in live.values()
-                              if (c.get("workspace") or {}).get("id") == ws
-                              and not c.get("floating")
-                              and (c.get("class") == it["class"] or c.get("initialClass") == it["class"])]
-                if not candidates:
-                    continue
-                best = max(candidates,
-                           key=lambda c: difflib.SequenceMatcher(
-                               None, norm_title(c.get("title")), norm_title(w.get("title"))).ratio())
-                score = difflib.SequenceMatcher(
-                    None, norm_title(best.get("title")), norm_title(w.get("title"))).ratio()
-                if score < 0.8:
-                    continue
-                by_ws.setdefault(ws, []).append((best["address"], w["at"][0], best))
+            c = live.get(addr)
+            if not c or c.get("floating"):
+                continue
+            ws = (c.get("workspace") or {}).get("id")
+            if not isinstance(ws, int):
+                continue
+            by_ws.setdefault(ws, {})[addr] = saved["at"][0]
+        for ws, xpos in by_ws.items():
+            if len(xpos) < 2:
+                continue
+            desired = [a for a, _x in sorted(xpos.items(), key=lambda t: (t[1], t[0]))]
+            self._order_workspace(ws, desired)
 
-        for ws, entries in by_ws.items():
-            if len(entries) < 2:
-                continue
-            # desired: sort by saved x; actual: sort by current x
-            desired = [a for a, x, _ in sorted(entries, key=lambda t: t[1])]
-            # bubble-swap neighbors that are out of order
-            for _ in range(len(desired)):
-                live = {c["address"]: c for c in hypr_json("clients")}
-                actual = sorted(desired, key=lambda a: (live.get(a, {}).get("at") or [0])[0])
-                if actual == desired:
+    def _order_workspace(self, ws, desired):
+        layout = self._layout(ws)
+        log(f"restore: order workspace {ws} layout={layout or '?'} windows={len(desired)}")
+        if layout == "scrolling":
+            self._order_scrolling(ws, desired)
+        else:
+            self._order_by_target_swap(ws, desired, layout)
+
+    def _order_by_target_swap(self, ws, desired, layout):
+        for _ in range(max(1, len(desired) * len(desired))):
+            if self._order_is_spread(desired):
+                log(f"restore: order workspace {ws} layout={layout or '?'} ok")
+                return
+            xs = self._live_xs(desired)
+            actual = sorted(desired, key=lambda a: (xs.get(a, 0), a))
+            i = inversion_index(actual, desired)
+            if i is None:
+                log(f"restore: order workspace {ws} layout={layout or '?'} "
+                    "windows still share a column; target swap has no inversion to fix")
+                return
+            left, right = actual[i], actual[i + 1]
+            before = dict(xs)
+            dispatch(
+                f"hl.dsp.window.swap({{ target = {lua_long('address:' + right)}, "
+                f"window = {lua_long('address:' + left)} }})"
+            )
+            time.sleep(0.05)
+            if self._live_xs(desired) == before:
+                log(f"restore: order workspace {ws} layout={layout or '?'} "
+                    f"target swap made no progress left={left} right={right}")
+                return
+        log(f"restore: order workspace {ws} layout={layout or '?'} stopped after max swaps")
+
+    def _order_scrolling(self, ws, desired):
+        rank = {a: i for i, a in enumerate(desired)}
+        for _ in range(len(desired) * 2):
+            if self._order_is_spread(desired):
+                break
+            xs = self._live_xs(desired)
+            split = False
+            for group in column_groups([(a, xs.get(a, 0)) for a in desired]):
+                if len(group) < 2:
+                    continue
+                addr = max(group, key=lambda t: rank.get(t[0], 0))[0]
+                self._focus(addr)
+                self._layout_msg("promote")
+                time.sleep(0.05)
+                log(f"restore: order workspace {ws} promote addr={addr} out of a shared column")
+                split = True
+                break
+            if not split:
+                break
+        if not self._order_is_spread(desired):
+            for _ in range(len(desired) * len(desired)):
+                if self._order_is_spread(desired):
                     break
-                # find first inversion in actual relative to desired index
-                rank = {a: i for i, a in enumerate(desired)}
-                swapped = False
-                for i in range(len(actual) - 1):
-                    if rank[actual[i]] > rank[actual[i + 1]]:
-                        addr = actual[i]
-                        dispatch(f"hl.dsp.window.swap({{ direction = {lua_long('r')}, window = {lua_long('address:' + addr)} }})")
-                        swapped = True
-                        time.sleep(0.05)
-                        break
-                if not swapped:
+                xs = self._live_xs(desired)
+                actual = sorted(desired, key=lambda a: (xs.get(a, 0), a))
+                i = inversion_index(actual, desired)
+                if i is None:
                     break
+                left = actual[i]
+                before = dict(xs)
+                self._focus(left)
+                self._layout_msg("swapcol r")
+                time.sleep(0.05)
+                if self._live_xs(desired) == before:
+                    log(f"restore: order workspace {ws} layout=scrolling swapcol made no progress "
+                        f"addr={left}; trying target swap")
+                    self._order_by_target_swap(ws, desired, "scrolling")
+                    return
+        if self._order_is_spread(desired):
+            log(f"restore: order workspace {ws} layout=scrolling ok")
+        else:
+            log(f"restore: order workspace {ws} layout=scrolling FAILED "
+                "(windows still share a column or left-to-right order disagrees)")
 
     def run(self, sess):
         self.sess = sess
@@ -2397,10 +3242,14 @@ class Restorer:
             k, cls, wins = it["kind"], it["class"], it["windows"]
             try:
                 if k == "browser":
+                    prof = it.get("profile") or ""
                     existing = self.unclaimed(cls, include_known=True)
-                    covered = self._titles_covered(existing, wins)
+                    annotated = [self._match_client(c) for c in existing]
+                    _pairs, notes = match_saved_windows(wins, annotated, prof)
+                    covered = not notes
+                    snapshot = False
                     if existing and covered:
-                        log(f"restore: {cls} already has these windows; placing by title")
+                        log(f"restore: {cls} profile={prof or '-'} already has these windows; placing by title")
                         self.known -= {c["address"] for c in existing}
                     else:
                         # Always launch per profile. Chromium's singleton opens the
@@ -2409,12 +3258,37 @@ class Restorer:
                         # when more than one profile was last active.
                         if existing:
                             self.known -= {c["address"] for c in existing}
-                        if not self.launch(it["argv"], primary_ws(it)):
+                        argv = list(it["argv"])
+                        ud = chromium_user_data(base(argv[0]) if argv else "", "", argv)
+                        if ud and prof:
+                            running = chromium_profile_is_running(ud, prof) or any(
+                                c.get("profile") == prof for c in annotated)
+                            snapshot, why = install_chromium_session(
+                                ud, prof, running=running,
+                                enabled=self.cfg.get("restore_chromium_session", True))
+                            log(f"restore: chrome profile {prof} session snapshot: {why}")
+                        argv = with_restore_last_session(argv)
+                        if not self.launch(argv, primary_ws(it)):
                             self.failed.append(cls)
-                            continue
-                    self.pending.append({"class": cls, "remaining": list(wins),
-                                         "placed": [],
-                                         "deadline": time.time() + self.cfg["browser_wait_seconds"]})
+                            if not existing:
+                                continue
+                            snapshot = False
+                            log(f"restore: {cls} profile={prof or '-'} did not launch; "
+                                "placing windows that are already open")
+                    wait = max(1, int(self.cfg.get("browser_wait_seconds", 150)))
+                    settle = max(1, int(self.cfg.get("browser_settle_seconds", 12)))
+                    now = time.time()
+                    # A restored snapshot should open every window on its own.
+                    # Give that a head start before replaying recently-closed
+                    # windows, so a slow cold start is not duplicated.
+                    reopen_after = now + (max(settle * 3, min(45, wait // 2)) if snapshot else settle)
+                    self.pending.append({
+                        "class": cls, "kind": "browser", "profile": prof,
+                        "remaining": list(wins), "snapshot": snapshot,
+                        "deadline": now + wait, "deadline_cap": now + wait + wait // 2,
+                        "reopen_after": reopen_after, "reopen_attempts": 0,
+                        "reopen_budget": len(wins), "reopen_stop": False,
+                    })
                     continue
                 if k in ("app", "webapp"):
                     existing = self.unclaimed(cls, include_known=True)
@@ -2445,9 +3319,7 @@ class Restorer:
             except Exception as e:  # never let one entry stop the rest
                 log(f"restore: {cls}: {e!r}")
                 self.failed.append(cls)
-        while self.pending:
-            self.step_pending(final=False)
-            time.sleep(1)
+        self.wait_pending()
         self.reorder_tiled(sess)
         if self.refocus and self.prev_focus:
             dispatch(f"hl.dsp.focus({{ window = {lua_long('address:' + self.prev_focus)} }})")

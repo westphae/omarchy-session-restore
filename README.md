@@ -14,7 +14,7 @@ quietly and restores once on the next login.
 | | |
 |---|---|
 | **Plugin id** | `eric.session-restore` |
-| **Version** | 1.3.0 |
+| **Version** | 1.3.1 |
 | **License** | MIT |
 | **Author** | Eric Westphal &lt;BonanzaEric@gmail.com&gt; |
 | **Based on** | [wbarakat/omarchy-session-restore](https://github.com/wbarakat/omarchy-session-restore) (MIT, © 2026 Waleed) |
@@ -193,7 +193,25 @@ Chrome (and Chromium-family browsers):
 **Settings → On startup → Continue where you left off**
 
 Do that once per profile you care about. This plugin launches each profile
-correctly; Chrome restores the tabs inside those windows.
+with `--profile-directory=…` and `--restore-last-session`.
+
+A normal logout closes Chrome's windows one by one, and Chrome then remembers
+only the last window of each profile. On every save that changes the window
+list, and on the final pre-logout save, the plugin keeps a private copy of
+that profile's Chrome session files. After a **clean** exit it puts that copy
+back before launch, so every window comes back. A crash is left alone —
+Chrome's own file still has the full session.
+
+Windows are matched to workspaces by title. Unread counts and a shortened
+tab title (`JLCPCB`, `Gmail`) still match, and each profile only takes its
+own windows. If something is still missing after new windows stop appearing,
+the plugin sends Chrome's reopen-closed-window shortcut (the same action as
+History → recently closed), once per missing window.
+
+Each matched window is moved to its saved workspace, and the move is checked.
+Tiled windows are then ordered left to right. On the scrolling layout each
+window is given its own column; a directional "swap right" is not used,
+because that dispatcher has no neighbor there and leaves the windows stacked.
 
 ---
 
@@ -207,7 +225,8 @@ correctly; Chrome restores the tabs inside those windows.
   conversation (Claude, Codex, Grok, Cursor Agent, Gemini, …).
 - **Multi-profile Chrome that just works.** Chromium-family browsers launch
   once per profile with `--profile-directory=…`, so the profile picker never
-  interrupts restore. Pair with Chrome → Settings → On startup →
+  interrupts restore. A clean logout no longer collapses each profile to its
+  last window. Pair with Chrome → Settings → On startup →
   **Continue where you left off**.
 - **Docked vs undocked layouts.** A separate layout is remembered for each
   display fingerprint (make/model/serial + geometry). Hotplug settles, then
@@ -240,7 +259,7 @@ correctly; Chrome restores the tabs inside those windows.
 | Kind | Detection | Restore behavior |
 |---|---|---|
 | **Terminals** | process / class table + `TerminalEmulator` desktop category | One window per saved window, with that terminal’s working-directory flag (or `env -C` / `xdg-terminal-exec --dir`). Known TUIs (herdr, tmux, zellij, nvim, btop, lazygit, yazi, …) relaunch; coding agents resume the same conversation. With the shell hook: Atuin session + tabs. |
-| **Browsers** | `WebBrowser` desktop category / binary table | Chromium-family: **once per profile** with `--profile-directory=…`. Firefox-family: once. Windows moved to saved workspaces by title. |
+| **Browsers** | `WebBrowser` desktop category / binary table | Chromium-family: **once per profile** with `--profile-directory=…`. A pre-logout session snapshot is restored after a clean exit. Firefox-family: once. Windows moved to saved workspaces by title. |
 | **Web apps** | `chrome-<site>-Default`-style classes | Via `.desktop` (`StartupWMClass`), else `--app=URL`, else URL from class. |
 | **Everything else** | `/proc/<pid>/cmdline`, flatpak cgroup, `$APPIMAGE`, `.desktop` | Same argv / `flatpak run` / AppImage / desktop `Exec`. Multi-window apps launch once; extras matched by title. |
 
@@ -277,7 +296,7 @@ arrange windows and a save runs.
 | Pin (all workspaces) | **full** | Hyprland pin; not macOS-style edge snap |
 | Monitor placement | **full** | workspace moved onto the matching physical monitor by identity |
 | Per-display layouts | **full** | fingerprint-keyed; hotplug settle + relayout |
-| Workspace layout mode | **partial** | dwindle / scrolling / floating via `o.workspace_mode`; **exact dwindle split tree is not exposed by Hyprland** |
+| Workspace layout mode | **partial** | dwindle / scrolling / floating via `o.workspace_mode`. Tiled windows are ordered left to right (scrolling: one column each). **Exact dwindle split tree is not exposed by Hyprland** |
 | Scrolling column widths | **unsupported** | hyprscrolling options are global; per-column widths not in IPC |
 | Special / scratchpad | **partial** | saved/restored by name (`special:scratchpad`); may interact with Omarchy qconsole |
 | Window groups | **unsupported** | `grouped` count is recorded; membership is not rebuilt |
@@ -376,7 +395,9 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
   "max_age_hours": 168,
   "max_login_age_seconds": 900,
   "save_interval_seconds": 60,
-  "browser_wait_seconds": 60,
+  "browser_wait_seconds": 150,
+  "browser_settle_seconds": 12,
+  "restore_chromium_session": true,
   "skip_classes": ["org.pulseaudio.pavucontrol"],
   "resume_commands": ["herdr", "tmux", "zellij", "nvim", "btop", "lazygit", "yazi"],
   "notify": true,
@@ -393,7 +414,9 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
 | `max_age_hours` | `168` | Don’t restore sessions older than this |
 | `max_login_age_seconds` | `900` | Only auto-restore this soon after Hyprland starts |
 | `save_interval_seconds` | `60` | Periodic autosave interval |
-| `browser_wait_seconds` | `60` | How long to wait for browser windows to appear |
+| `browser_wait_seconds` | `150` | Cap on how long to wait for browser windows. Restore returns as soon as every saved window has matched. While new windows are still appearing the cap can stretch by half again |
+| `browser_settle_seconds` | `12` | Quiet period with no new windows before reopening a missing Chrome window |
+| `restore_chromium_session` | `true` | After a clean Chrome exit, restore the pre-logout session snapshot so every window comes back |
 | `skip_classes` | `[]` | Window classes never saved (full-match regexes) |
 | `resume_commands` | *(built-in TUI list)* | Foreground programs to relaunch in terminals |
 | `notify` | `true` | Desktop notifications on restore |
@@ -408,13 +431,16 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
 
 * **Dwindle split tree** — Hyprland does not expose the exact split tree over
   IPC. Workspace *mode* (dwindle / scrolling / floating) is restored; exact
-  split ratios are not. Tiled windows are re-ordered left-to-right; if the
-  layout still disagrees, drag one past the other once.
+  split ratios are not. Tiled windows are ordered left to right (on the
+  scrolling layout, each in its own column). If the layout still disagrees,
+  drag one past the other once.
 * **Scrolling column widths** — hyprscrolling column widths are not in IPC.
 * **First time on a new dock / display** — no saved layout yet; arrange once,
   then autosave remembers it for next time.
 * **Browsers** need their own session restore (Chrome: *Continue where you
-  left off*). Titles are used to match windows to workspaces/profiles.
+  left off*). Titles are used to match windows to workspaces. After a clean
+  exit the plugin restores Chrome's pre-logout session so windows the logout
+  close dropped are not lost; turn that off with `restore_chromium_session`.
 * **Terminal scrollback** and arbitrary running processes are not preserved —
   only folder, Atuin session (with hook), known TUIs, and coding-agent
   conversations.
