@@ -43,7 +43,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "1.3.3"
+VERSION = "1.3.4"
 FORMAT = 1
 HOME = os.path.expanduser("~")
 XDG_STATE = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state")
@@ -977,6 +977,18 @@ def terminal_spec(cls, pbase, desk_entry):
     return None, None
 
 
+def is_saved_terminal(cls, pbase, term_key, spec, desk_e):
+    """True when this window is the terminal itself, not a TUI with a custom class."""
+    if not term_key:
+        return False
+    classes = [x.lower() for x in (spec or {}).get("classes") or []]
+    own_class = cls in ((spec or {}).get("classes") or []) or cls.lower() in classes
+    desktop_term = bool(desk_e and "TerminalEmulator" in desk_e.get("cats", []))
+    if spec and pbase in TERMINALS and not own_class and not desktop_term:
+        return False
+    return own_class or desktop_term or spec is None
+
+
 def is_shell(pid):
     a = cmdline(pid)
     b = base(a[0]).lstrip("-") if a else ""
@@ -1276,17 +1288,32 @@ def proc_start_epoch(pid):
 
 
 def shell_hook_state(pid):
-    """(hooked, atuin_session) as recorded by shell/session-hook.sh for this shell."""
+    """Fresh hook record for this shell, or None.
+
+    The optional shell hook writes ``shell-<pid>`` with the Atuin session on
+    the first line and, when it knows it, the shell's directory on the second.
+    A file from an earlier process that reused the pid is ignored. Working
+    directories do not depend on this file: ``/proc/<pid>/cwd`` is the source
+    of truth, and the hook directory is only a fallback when that read fails
+    or the window cannot be matched to one shell.
+    """
     p = os.path.join(RUNTIME_DIR, f"shell-{pid}")
     try:
         st = os.stat(p)
         if st.st_uid != os.getuid() or st.st_mtime + 2 < proc_start_epoch(pid):
-            return False, ""   # stale file from an earlier process with the same pid
+            return None
         with open(p) as f:
-            v = f.read(100).strip()
+            text = f.read(512)
     except OSError:
-        return False, ""
-    return True, (v if ATUIN_RE.fullmatch(v) else "")
+        return None
+    lines = text.splitlines()
+    atuin = lines[0].strip() if lines else ""
+    cwd = lines[1].strip() if len(lines) > 1 else ""
+    if not ATUIN_RE.fullmatch(atuin):
+        atuin = ""
+    if not (cwd.startswith("/") and "\0" not in cwd):
+        cwd = ""
+    return {"fresh": True, "atuin": atuin, "cwd": cwd}
 
 
 def cleanup_shell_files():
@@ -1300,17 +1327,45 @@ def cleanup_shell_files():
 
 
 def shell_info(cfg, k):
-    cwd = cwd_of(k) or HOME
-    hooked, atuin = shell_hook_state(k)
-    resume, label = resume_argv(cfg, k), ""
+    """State of one interactive shell. The directory is the shell's own cwd.
+
+    A foreground program (vim, ssh, a coding agent) keeps its own cwd and
+    must not replace the folder the user cd'd into. The optional hook only
+    fills in an Atuin session id, or a directory when /proc cannot be read.
+    """
+    try:
+        cwd = cwd_of(k) or ""
+    except OSError:
+        cwd = ""
+    try:
+        hook = shell_hook_state(k)
+    except OSError:
+        hook = None
+    atuin = hook["atuin"] if hook else ""
+    hooked = bool(hook)
+    if not cwd and hook and hook.get("cwd"):
+        cwd = hook["cwd"]
+    if not cwd:
+        cwd = HOME
+    resume, label = None, ""
+    try:
+        resume = resume_argv(cfg, k)
+    except OSError:
+        resume = None
     if resume:
         label = base(resume[0])
     elif cfg.get("resume_agents", True):
-        ag = agent_resume(k)
+        try:
+            ag = agent_resume(k)
+        except OSError:
+            ag = None
         if ag:
             resume, label = ag["resume"], ag["label"]
-            cwd = ag["cwd"] or cwd
-    return {"pid": k, "start": stat_of(k)["start"], "cwd": cwd, "resume": resume,
+    try:
+        start = stat_of(k)["start"]
+    except OSError:
+        start = 0
+    return {"pid": k, "start": start, "cwd": cwd, "resume": resume,
             "label": label, "atuin": atuin, "hooked": hooked}
 
 
@@ -1324,6 +1379,160 @@ def title_paths(title):
         elif part.startswith("/"):
             cands.append(part)
     return [os.path.normpath(c) for c in cands]
+
+
+class LiveProc:
+    """Process-tree reads against /proc. Every method swallows permission and vanished-pid errors."""
+
+    def children(self, pid):
+        try:
+            return children(pid)
+        except OSError:
+            return []
+
+    def is_shell(self, pid):
+        try:
+            return is_shell(pid)
+        except OSError:
+            return False
+
+    def cwd(self, pid):
+        try:
+            return cwd_of(pid) or ""
+        except OSError:
+            return ""
+
+    def start(self, pid):
+        try:
+            return stat_of(pid)["start"]
+        except OSError:
+            return 0
+
+    def hook(self, pid):
+        try:
+            return shell_hook_state(pid)
+        except OSError:
+            return None
+
+
+def _proc_call(proc, name, pid, default):
+    try:
+        return getattr(proc, name)(pid)
+    except OSError:
+        return default
+
+
+def assign_terminal_directories(windows, term_pid, proc, home):
+    """Map each terminal window to the interactive shell's cwd.
+
+    ``windows`` is a list of ``{"stable", "title"}`` for every window of one
+    terminal process (ghostty included: several windows, one pid). The shell
+    is a direct child of that process — not vim, ssh, or a shell nested
+    inside them. When there is one shell per window, they pair in start
+    order. A single window uses its earliest shell; later shells are tabs.
+    Anything that cannot be paired returns ``home`` unless a fresh hook
+    record identifies exactly one directory.
+
+    Returns one dict per input window, in the same order:
+    ``cwd``, ``atuin``, ``hooked``, ``source`` (``proc``, ``hook``, or ``home``),
+    ``shell_pid`` (or None), ``tab_pids`` (extra shells that belong to this window).
+    """
+    home = home or "/"
+    n = len(windows)
+    order = sorted(range(n), key=lambda i: ((windows[i].get("stable") or 0), i))
+    shells = []
+    for kid in _proc_call(proc, "children", term_pid, []) or []:
+        if _proc_call(proc, "is_shell", kid, False):
+            shells.append(kid)
+    if not shells and _proc_call(proc, "is_shell", term_pid, False):
+        shells = [term_pid]
+
+    assigned = {}
+    reliable = set()
+    extras = []
+    if shells and len(shells) == n:
+        for pos, sh in zip(order, shells):
+            assigned[pos] = sh
+            reliable.add(pos)
+    elif n == 1 and shells:
+        assigned[order[0]] = shells[0]
+        reliable.add(order[0])
+        extras = shells[1:]
+    else:
+        free = list(shells)
+        for pos in order:
+            cwd_hits = []
+            for sh in free:
+                cwd = _proc_call(proc, "cwd", sh, "") or ""
+                if cwd and os.path.normpath(cwd) in title_paths(windows[pos].get("title") or ""):
+                    cwd_hits.append(sh)
+            if len(cwd_hits) == 1:
+                assigned[pos] = cwd_hits[0]
+                reliable.add(pos)
+                free.remove(cwd_hits[0])
+        left = [pos for pos in order if pos not in assigned]
+        if len(left) == 1 and len(free) == 1:
+            assigned[left[0]] = free[0]
+            reliable.add(left[0])
+            free = []
+        extras = [sh for sh in free if sh not in assigned.values()]
+
+    tab_of = {i: [] for i in range(n)}
+    for sh in extras:
+        st = _proc_call(proc, "start", sh, 0)
+        hosts = [i for i, sp in assigned.items()
+                 if i in reliable and _proc_call(proc, "start", sp, 0) <= st]
+        if len(hosts) == 1:
+            tab_of[hosts[0]].append(sh)
+        elif n == 1 and order and order[0] in reliable:
+            tab_of[order[0]].append(sh)
+
+    unmatched = [i for i in range(n) if i not in reliable]
+    hook_for = {}
+    # Shells we could not attach, plus extras that were not taken as tabs, are
+    # the pool a single unmatched window may borrow a hook directory from.
+    pool = []
+    for sh in shells:
+        if sh in assigned.values():
+            continue
+        if any(sh in tabs for tabs in tab_of.values()):
+            continue
+        pool.append(sh)
+    if len(unmatched) == 1 and len(pool) == 1:
+        hook = _proc_call(proc, "hook", pool[0], None)
+        if hook and hook.get("fresh") and (hook.get("cwd") or "").startswith("/"):
+            hook_for[unmatched[0]] = (hook, None)
+
+    out = []
+    for i in range(n):
+        if i in reliable and i in assigned:
+            cwd, atuin, hooked, source, spid = _cwd_for_shell(assigned[i], proc, home)
+        elif i in hook_for:
+            hook, _sp = hook_for[i]
+            cwd, atuin, hooked, source, spid = hook["cwd"], hook.get("atuin") or "", True, "hook", None
+        else:
+            cwd, atuin, hooked, source, spid = home, "", False, "home", None
+        out.append({
+            "cwd": cwd, "atuin": atuin, "hooked": hooked, "source": source,
+            "shell_pid": spid, "tab_pids": list(tab_of.get(i) or []),
+        })
+    return out
+
+
+def _cwd_for_shell(shell_pid, proc, home):
+    """Shell cwd from /proc. Hook directory only if that read fails."""
+    hook = _proc_call(proc, "hook", shell_pid, None)
+    cwd = _proc_call(proc, "cwd", shell_pid, "") or ""
+    if cwd and not cwd.startswith("/"):
+        cwd = ""
+    fresh = bool(hook and hook.get("fresh"))
+    atuin = (hook.get("atuin") or "") if fresh else ""
+    if cwd:
+        return cwd, atuin, fresh, "proc", shell_pid
+    hcwd = (hook.get("cwd") or "") if fresh else ""
+    if hcwd.startswith("/"):
+        return hcwd, atuin, True, "hook", shell_pid
+    return home, atuin, fresh, "home", shell_pid
 
 
 def terminal_base_argv(term_key, spec, pargv, desk_entry):
@@ -2245,6 +2454,26 @@ def snapshot(cfg):
         classes = {}
         for c in cs:
             classes.setdefault(c.get("class") or c.get("initialClass") or "", []).append(c)
+        # One ghostty process can own several windows, including the floating
+        # org.omarchy.terminal. Pair shells once for the whole process so a
+        # window is not given some other window's directory.
+        shell_plan = {}
+        term_views, term_clients = [], []
+        for cls0, wins0 in classes.items():
+            key0, spec0 = terminal_spec(cls0, pbase, desk.for_class(cls0, names))
+            if not is_saved_terminal(cls0, pbase, key0, spec0, desk.for_class(cls0, names)):
+                continue
+            for c in wins0:
+                rec = window_record(c)
+                term_views.append({"stable": rec["stable"], "title": c.get("title") or ""})
+                term_clients.append(c)
+        if term_views:
+            try:
+                paired = assign_terminal_directories(term_views, pid, LiveProc(), HOME)
+            except OSError:
+                paired = []
+            for c, rec in zip(term_clients, paired):
+                shell_plan[id(c)] = rec
         for cls, wins in classes.items():
             wins.sort(key=lambda c: window_record(c)["stable"])
             desk_e = desk.for_class(cls, names)
@@ -2340,40 +2569,34 @@ def snapshot(cfg):
                              (desk_e and "TerminalEmulator" in desk_e["cats"])):
                 tdesk = desk_e if (desk_e and "TerminalEmulator" in desk_e["cats"]) else None
                 base_argv = terminal_base_argv(term_key, spec, pargv, tdesk)
-                kids = children(pid)
-                shells = [k for k in kids if is_shell(k)] or kids
-                info = [shell_info(cfg, k) for k in shells]
-                assigned = {}
-                free = list(range(len(info)))
-                if len(info) != len(wins):
-                    # title -> cwd match first when counts disagree
-                    for wi, c in enumerate(wins):
-                        for path in title_paths(c.get("title", "")):
-                            hits = [i for i in free if os.path.normpath(info[i]["cwd"]) == path]
-                            if len(hits) == 1:
-                                assigned[wi] = hits[0]
-                                free.remove(hits[0])
-                                break
-                for wi in range(len(wins)):
-                    if wi not in assigned and free:
-                        assigned[wi] = free.pop(0)
-                # Shells left over are tabs/splits. Nothing exposes which window a
-                # tab belongs to, so attach each to the window whose first shell
-                # started most recently before it (tabs are opened after their window).
-                extra = {}
-                prim = {wi: info[i]["start"] for wi, i in assigned.items()}
-                for i in free:
-                    st = info[i]["start"]
-                    before = [wi for wi in prim if prim[wi] <= st]
-                    if before:
-                        extra.setdefault(max(before, key=lambda w: prim[w]), []).append(info[i])
-                    elif prim:
-                        extra.setdefault(min(prim, key=lambda w: prim[w]), []).append(info[i])
-                for wi, c in enumerate(wins):
-                    sh = info[assigned[wi]] if wi in assigned else {
-                        "cwd": cwd_of(pid) or HOME, "resume": None, "label": "", "atuin": "", "hooked": False}
+                for c in wins:
+                    plan = shell_plan.get(id(c)) or {
+                        "cwd": HOME, "atuin": "", "hooked": False, "source": "home",
+                        "shell_pid": None, "tab_pids": []}
+                    if plan.get("shell_pid"):
+                        try:
+                            sh = shell_info(cfg, plan["shell_pid"])
+                        except OSError:
+                            sh = {"cwd": HOME, "resume": None, "label": "", "atuin": "",
+                                  "hooked": False, "start": 0}
+                        sh["cwd"] = plan["cwd"]
+                        if plan.get("atuin"):
+                            sh["atuin"] = plan["atuin"]
+                            sh["hooked"] = True
+                    else:
+                        sh = {"cwd": plan["cwd"], "resume": None, "label": "",
+                              "atuin": plan.get("atuin") or "", "hooked": bool(plan.get("hooked")),
+                              "start": 0}
+                    extra = []
+                    for tpid in plan.get("tab_pids") or []:
+                        try:
+                            extra.append(shell_info(cfg, tpid))
+                        except OSError:
+                            continue
+                    if plan.get("source") != "proc":
+                        log(f"save: terminal {cls} cwd source={plan.get('source')}")
                     tabs = []
-                    for t in [sh] + sorted(extra.get(wi, []), key=lambda t: t["start"]):
+                    for t in [sh] + sorted(extra, key=lambda t: t.get("start") or 0):
                         tabs.append({"cwd": t["cwd"], "atuin": t["atuin"], "hooked": t["hooked"],
                                      "resume": t["resume"], "label": t["label"],
                                      "argv": ensure_terminal_class(
@@ -2387,7 +2610,8 @@ def snapshot(cfg):
                                   "argv": tabs[0]["argv"], "cwd": sh["cwd"], "resume": sh["resume"],
                                   "plain_argv": plain,
                                   "tabs": tabs,
-                                  "strategy": f"{term_key} working-directory flag" if spec else "generic terminal",
+                                  "strategy": (f"{term_key} working-directory from {plan.get('source')}"
+                                               if spec else f"generic terminal, cwd from {plan.get('source')}"),
                                   "windows": [window_record(c)]})
                 continue
 
@@ -2933,8 +3157,8 @@ def print_plan(sess):
     use_uwsm = bool(shutil.which("uwsm-app"))
     hooked = hook_installed()
     if not hooked:
-        print("\nNote: the shell hook is not installed (omarchy-session install-hook), so terminals restore"
-              " their cwd and program but get new Atuin sessions.")
+        print("\nNote: the optional shell hook is not installed. Terminals still reopen in the"
+              " shell's directory; install-hook only adds the same Atuin session and tab handoff.")
     for n, it in enumerate(ordered_items(sess), 1):
         k = it["kind"]
         if k == "browser":
@@ -4128,7 +4352,7 @@ def status(args):
         print(f"last restore: {time.strftime('%Y-%m-%d %H:%M %Z', time.localtime(lr['at']))}")
     except (OSError, ValueError, KeyError):
         print("last restore: never")
-    print(f"shell hook: {'installed' if hook_installed() else 'not installed (run: omarchy-session install-hook)'}"
+    print(f"shell hook: {'installed' if hook_installed() else 'not installed (optional; directories do not need it)'}"
           f" — {HOOK_FILE}")
     print(f"log: {LOG}")
     return 0
@@ -4149,7 +4373,7 @@ def main():
     g.add_argument("--prev", action="store_true", help="use the previous good copy (session.prev.json)")
     r.add_argument("--workspace", "-w", action="append", metavar="N",
                    help="only restore windows saved on this workspace (repeatable; needs --file or --dry-run)")
-    sub.add_parser("install-hook", help="add the per-terminal hook (Atuin session, tabs, resume) to ~/.bashrc / ~/.zshrc")
+    sub.add_parser("install-hook", help="optional: record Atuin sessions in ~/.bashrc / ~/.zshrc (directories do not need this)")
     sub.add_parser("uninstall-hook", help="remove that line again")
     ct = sub.add_parser("claim-tab", help="(used by the shell hook)")
     ct.add_argument("queue")
