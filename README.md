@@ -14,7 +14,7 @@ quietly and restores once on the next login.
 | | |
 |---|---|
 | **Plugin id** | `eric.session-restore` |
-| **Version** | 1.3.3 |
+| **Version** | 1.3.4 |
 | **License** | MIT |
 | **Author** | Eric Westphal &lt;BonanzaEric@gmail.com&gt; |
 | **Based on** | [wbarakat/omarchy-session-restore](https://github.com/wbarakat/omarchy-session-restore) (MIT, © 2026 Waleed) |
@@ -112,18 +112,22 @@ The snippet uses `$HOME`, which the menu expands. If you already customized
 those three system actions, put `omarchy-session save --final --quiet;` in
 front of your command instead of replacing it.
 
-**3. Shell hook, for terminal continuity.** Each terminal comes back with
-the same Atuin history and Ghostty tabs, and a resumed program stays inside
-the shell. Without the hook, terminals still reopen in the right folder,
-with their program and coding agent, but each gets a new Atuin session and
-a single tab. Bash and zsh only.
+You do not need to change `~/.bashrc` or `~/.zshrc`. The folder a terminal
+reopens in is the interactive shell's directory, read from `/proc` at save
+time. That includes Ghostty and Omarchy's floating terminal.
+
+**Optional: Atuin session and Ghostty tabs.** If you want the same Atuin
+history and the saved program started inside the new shell, install the
+hook yourself. It is not part of the normal install and nothing writes it
+for you:
 
 ```bash
 omarchy-session install-hook
 ```
 
-That needs step 1. New terminals pick the hook up; ones already open keep
-working as they are until you restart them.
+That adds one line to `~/.bashrc` (and `~/.zshrc` if you have one). New
+shells pick it up; ones already open keep working as they are until you
+restart them. Uninstall it with `omarchy-session uninstall-hook`.
 
 ### Update, pause, or remove
 
@@ -236,9 +240,9 @@ because that dispatcher has no neighbor there and leaves the windows stacked.
 - **One reboot, same desk.** Apps, workspaces, floating size/position,
   fullscreen, maximized, and pin come back without a restore wizard.
 - **Terminals that feel continuous.** Each window returns in its working
-  directory; with the optional shell hook you also get the same **Atuin
-  session**, Ghostty **tabs**, and a **coding agent** resumed into the same
-  conversation (Claude, Codex, Grok, Cursor Agent, Gemini, …).
+  directory, read from the shell itself. The optional shell hook adds the
+  same **Atuin** session and Ghostty **tabs**. A **coding agent** resumes
+  into the same conversation (Claude, Codex, Grok, Cursor Agent, Gemini, …).
 - **Multi-profile Chrome that just works.** Chromium-family browsers launch
   once per profile with `--profile-directory=…`, so the profile picker never
   interrupts restore. A clean logout no longer collapses each profile to its
@@ -260,7 +264,7 @@ because that dispatcher has no neighbor there and leaves the windows stacked.
 | Area | What you get |
 |---|---|
 | **Windows** | Apps relaunched on the workspaces they were on; floating geometry, fullscreen, maximized, pin |
-| **Terminals** | ghostty, kitty, alacritty, foot, wezterm, and any `TerminalEmulator` desktop entry — cwd restored; optional Atuin session + tabs + agent resume |
+| **Terminals** | ghostty (including `org.omarchy.terminal`), kitty, alacritty, foot, wezterm, and any `TerminalEmulator` — the shell's cwd, no shell rc changes; optional Atuin session + tabs + agent resume |
 | **Browsers** | Chrome / Chromium / Brave / Edge / Vivaldi / … once per profile; Firefox-family once; web apps via `.desktop` / `--app=` |
 | **Other apps** | Flatpak, AppImage, and argv from `/proc` — multi-window apps launch once, extras matched by title |
 | **Per-display** | Fingerprint-keyed layouts under `~/.local/state/omarchy/session-restore/layouts/` |
@@ -274,7 +278,7 @@ because that dispatcher has no neighbor there and leaves the windows stacked.
 
 | Kind | Detection | Restore behavior |
 |---|---|---|
-| **Terminals** | process / class table + `TerminalEmulator` desktop category | One window per saved window, with that terminal’s working-directory flag (or `env -C` / `xdg-terminal-exec --dir`). Known TUIs (herdr, tmux, zellij, nvim, btop, lazygit, yazi, …) relaunch; coding agents resume the same conversation. With the shell hook: Atuin session + tabs. |
+| **Terminals** | process / class table + `TerminalEmulator` desktop category | One window per saved window. The directory is `/proc/<shell>/cwd` of the interactive shell that is the terminal's direct child — not vim, ssh, or an agent. Several Ghostty windows in one process are paired with those shells in start order. If a window cannot be paired, a fresh hook directory is used when it identifies exactly one folder, otherwise `$HOME`. Known TUIs relaunch; coding agents resume. The shell hook is optional and only adds the Atuin session and tab handoff. |
 | **Browsers** | `WebBrowser` desktop category / binary table | Chromium-family: **once per profile** with `--profile-directory=…`. A pre-logout session snapshot is restored after a clean exit. Firefox-family: once. Windows moved to saved workspaces by title. |
 | **Web apps** | `chrome-<site>-Default`-style classes | Via `.desktop` (`StartupWMClass`), else `--app=URL`, else URL from class. |
 | **Everything else** | `/proc/<pid>/cmdline`, flatpak cgroup, `$APPIMAGE`, `.desktop` | Same argv / `flatpak run` / AppImage / desktop `Exec`. Multi-window apps launch once; extras matched by title. |
@@ -322,18 +326,38 @@ There is **no** native Hyprland “layout dump.” Everything goes through
 
 ---
 
-## Terminals: Atuin, tabs, coding agents
+## Terminals: directories, and the optional hook
 
-Run `omarchy-session install-hook` once. It adds one line to `~/.bashrc`
-(and `~/.zshrc` if present) right after `atuin init`, with a backup:
+No shell rc change is required. At save time each terminal window's pid
+comes from Hyprland. The interactive shell that is that process's direct
+child (bash, zsh, fish, and the other shells the plugin already knows) is
+the one whose `/proc/<pid>/cwd` is stored. That is the folder you `cd`'d
+into, even when vim, ssh, or an agent is running in front of it. Ghostty
+windows that share one process, including Omarchy's floating
+`org.omarchy.terminal`, are matched to those shells in the order they
+started. A unique directory in the window title can break a tie. If a
+window still cannot be matched, or `/proc` cannot be read, a fresh hook
+file is used only when it names exactly one directory; otherwise the
+terminal reopens in your home directory.
+
+The hook is optional. Install it only for the same Atuin session and for
+Ghostty tabs that claim their saved state:
+
+```bash
+omarchy-session install-hook
+```
+
+It adds one line to `~/.bashrc` (and `~/.zshrc` if present) right after
+`atuin init`, with a backup:
 
 ```bash
 [ -f ~/.config/omarchy/plugins/eric.session-restore/shell/session-hook.sh ] && . ~/.config/omarchy/plugins/eric.session-restore/shell/session-hook.sh  # omarchy-session-restore hook
 ```
 
-At shell start the hook records `$ATUIN_SESSION` under
-`$XDG_RUNTIME_DIR/omarchy-session-restore/` (mode 600). When a restore opened
-the terminal, it claims that tab’s saved state: `cd`, `export ATUIN_SESSION=…`,
+At shell start the hook records `$ATUIN_SESSION` and `$PWD` under
+`$XDG_RUNTIME_DIR/omarchy-session-restore/` (mode 600). The directory there
+is a fallback, not the normal source. When a restore opened the terminal,
+the hook claims that tab’s saved state: `cd`, `export ATUIN_SESSION=…`,
 and the program to resume at the first prompt so the shell stays open after
 it exits. Values are validated and shell-quoted.
 
@@ -354,8 +378,8 @@ own “continue latest” (`claude --continue`, `codex resume --last`, …).
 Permission-skipping flags are never added; one-shot runs (`claude -p`, …) are
 not restarted; no prompt is ever sent. Agents inside herdr are left to herdr.
 
-Without the hook, terminals still return in the right folder with program and
-agent resumed, but each gets a new Atuin session and only one tab.
+Without the hook, terminals still return in the shell's folder with the
+program and agent resumed, but each gets a new Atuin session and only one tab.
 
 ---
 
@@ -396,8 +420,8 @@ omarchy-session restore --force     # restore now even if checks would skip
 omarchy-session restore --prev      # previous good copy
 omarchy-session restore --file F    # specific file (not consumed)
 omarchy-session restore --file F --workspace 4
-omarchy-session install-hook        # Atuin + tabs + agents
-omarchy-session uninstall-hook
+omarchy-session install-hook        # optional: Atuin session + tab handoff (not required for directories)
+omarchy-session uninstall-hook        # only if you installed that hook
 omarchy-session disable | enable
 ```
 
@@ -458,8 +482,8 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
   exit the plugin restores Chrome's pre-logout session so windows the logout
   close dropped are not lost; turn that off with `restore_chromium_session`.
 * **Terminal scrollback** and arbitrary running processes are not preserved —
-  only folder, Atuin session (with hook), known TUIs, and coding-agent
-  conversations.
+  only the shell's folder, an Atuin session (only if you installed the
+  optional hook), known TUIs, and coding-agent conversations.
 * **Ghostty splits** come back as tabs; tab-to-window assignment is based on
   shell start times. Ghostty restored windows run with
   `--gtk-single-instance=false` so `--working-directory` is honored.

@@ -1,9 +1,13 @@
 # omarchy-session-restore shell hook (bash and zsh) — part of eric.session-restore.
 #
-# Source this from ~/.bashrc / ~/.zshrc AFTER `atuin init` (or let
-# `omarchy-session install-hook` add the line). It does two small things:
-#   1. records this shell's ATUIN_SESSION in $XDG_RUNTIME_DIR so the next
-#      save can give the restored terminal the same Atuin session, and
+# Optional. Working directories are read from /proc and do not need this
+# file. Source it from ~/.bashrc / ~/.zshrc AFTER `atuin init` only if you
+# want the same Atuin session (and, on restore, the saved program started
+# inside the new shell). `omarchy-session install-hook` adds that line;
+# nothing in the normal install does.
+#   1. records this shell's ATUIN_SESSION and $PWD in $XDG_RUNTIME_DIR so a
+#      save can reuse the Atuin session, and can fall back to this directory
+#      when /proc/<pid>/cwd cannot be read, and
 #   2. when a restore opened this terminal (OMARCHY_SR_QUEUE is set), asks
 #      omarchy-session for this tab's saved state — cwd, Atuin session and the
 #      program to resume — and re-runs that program at the first prompt, so
@@ -48,6 +52,6 @@ type __osr_arm >/dev/null 2>&1 && unset -f __osr_arm
 
 __osr_d="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omarchy-session-restore"
 if [ -d "$__osr_d" ] || mkdir -m 700 -p "$__osr_d" 2>/dev/null; then
-  (umask 077; printf '%s\n' "${ATUIN_SESSION:-}" >| "$__osr_d/shell-$$") 2>/dev/null
+  (umask 077; printf '%s\n%s\n' "${ATUIN_SESSION:-}" "${PWD:-}" >| "$__osr_d/shell-$$") 2>/dev/null
 fi
 unset __osr_d
