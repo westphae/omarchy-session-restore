@@ -158,7 +158,7 @@ class ChromeSessionSnapshotTests(unittest.TestCase):
         self._sidecar()
         ok, why = m.install_chromium_session(self.ud, self.prof, running=False, enabled=True)
         self.assertFalse(ok)
-        self.assertEqual(why, "clean-exit")
+        self.assertEqual(why, "crashed-exit")
         self.assertFalse(os.path.exists(os.path.join(self.sessions, "Session_11")))
 
         self._prefs("Normal", True)
@@ -205,6 +205,75 @@ class ChromeSessionSnapshotTests(unittest.TestCase):
         self.assertEqual(again.count("--restore-last-session"), 1)
         ff = m.with_restore_last_session(["firefox"])
         self.assertNotIn("--restore-last-session", ff)
+
+
+class NamePlacementTests(unittest.TestCase):
+    def test_xdg_tag_identifies_the_window_across_a_title_change(self):
+        saved = {"title": "Inbox (345) - me - Gmail", "xdg_tag": "mail-main", "initial_title": ""}
+        live = {"title": "Gmail", "xdgTag": "mail-main", "initialTitle": "Google Chrome"}
+        self.assertEqual(m.window_name_score(saved, live), 1.0)
+
+    def test_loading_name_is_taken_only_for_the_last_window_of_that_profile(self):
+        saved = [
+            {"class": "google-chrome", "profile": "Default", "title": GMAIL,
+             "initial_title": "", "xdg_tag": "", "workspace": 5, "ws_name": "5"},
+            {"class": "google-chrome", "profile": "Default", "title": YOUTUBE,
+             "initial_title": "", "xdg_tag": "", "workspace": 5, "ws_name": "5"},
+        ]
+        clients = [
+            {"class": "google-chrome", "profile": "Default", "title": GMAIL_SHORT,
+             "initialTitle": "Google Chrome", "xdgTag": ""},
+            {"class": "google-chrome", "profile": "Profile 1", "title": DORMOUSE,
+             "initialTitle": DORMOUSE, "xdgTag": ""},
+        ]
+        pairs = m.match_windows_by_name(saved, clients)
+        self.assertEqual(pairs, [])
+        pairs = m.match_windows_by_name(saved[:1], clients[:1])
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0][0], 0)
+
+    def test_rule_uses_the_window_name_and_escapes_it(self):
+        sess = {"items": [{
+            "class": "google-chrome",
+            "windows": [
+                {"title": "Inbox (1) - a+b", "initial_title": "", "xdg_tag": "",
+                 "workspace": 4, "ws_name": "4"},
+                {"title": "Inbox (1) - a+b", "initial_title": "", "xdg_tag": "",
+                 "workspace": 3, "ws_name": "3"},
+                {"title": "TIDAL - Google Chrome", "initial_title": "TIDAL - Google Chrome",
+                 "xdg_tag": "", "workspace": 5, "ws_name": "5"},
+            ],
+        }]}
+        specs = m.name_rule_specs(sess)
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0]["workspace"], "5")
+        self.assertEqual(specs[0]["field"], "initial_title")
+        lua = m.lua_window_rule(specs[0])
+        self.assertIn("initial_title", lua)
+        self.assertIn("5 silent", lua)
+        self.assertIn(m.title_regex("TIDAL - Google Chrome"), lua)
+        self.assertNotIn("a+b", lua)
+        self.assertNotIn("notify-send", lua)
+
+    def test_session_ended_reboot_still_installs_the_snapshot(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        ud = os.path.join(tmp, "google-chrome")
+        sessions = os.path.join(ud, "Default", "Sessions")
+        os.makedirs(sessions)
+        side = m.chrome_sidecar_dir(ud, "Default")
+        self.addCleanup(shutil.rmtree, side, True)
+        os.makedirs(side, mode=0o700, exist_ok=True)
+        with open(os.path.join(side, "Session"), "wb") as f:
+            f.write(b"SNSS-ended")
+        with open(os.path.join(side, "Tabs"), "wb") as f:
+            f.write(b"SNSS-tabs")
+        with open(os.path.join(ud, "Default", "Preferences"), "w") as f:
+            json.dump({"profile": {"exit_type": "SessionEnded", "exited_cleanly": False}}, f)
+        ok, why = m.install_chromium_session(ud, "Default", running=False, enabled=True)
+        self.assertEqual((ok, why), (True, "installed"))
+        with open(os.path.join(sessions, "Session_1"), "rb") as f:
+            self.assertEqual(f.read(), b"SNSS-ended")
 
 
 class NotifyTests(unittest.TestCase):

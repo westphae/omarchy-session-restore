@@ -43,7 +43,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 FORMAT = 1
 HOME = os.path.expanduser("~")
 XDG_STATE = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state")
@@ -1559,13 +1559,12 @@ def chrome_sidecar_dir(user_data, profile):
     return os.path.join(STATE_DIR, "chrome-sessions", key)
 
 
-def chromium_clean_exit(user_data, profile):
-    """True only when Chrome itself recorded a clean quit.
+def chromium_exit_kind(user_data, profile):
+    """How Chrome last quit: 'normal', 'ended', 'crashed', or None.
 
-    A clean quit is the bad case for multi-window restore: Hyprland closes
-    each window, Chrome appends a close to its session, and the next launch
-    reopens only the last window. A crash leaves the full session in place,
-    so that file must not be replaced.
+    A normal quit and a SessionEnded reboot both leave a session file that
+    has already recorded window closes, so only the last window comes back.
+    A crash leaves the full session on disk; that file must not be replaced.
     """
     path = os.path.join(user_data, profile, "Preferences")
     try:
@@ -1576,9 +1575,19 @@ def chromium_clean_exit(user_data, profile):
     prof = prefs.get("profile") if isinstance(prefs, dict) else None
     if not isinstance(prof, dict):
         return None
-    if prof.get("exit_type") == "Normal" and prof.get("exited_cleanly") is True:
-        return True
-    return False
+    kind = str(prof.get("exit_type") or "")
+    clean = prof.get("exited_cleanly")
+    if kind == "Crashed":
+        return "crashed"
+    if kind == "Normal" and clean is True:
+        return "normal"
+    # SessionEnded is what a reboot often records: the session file already
+    # contains the window closes, same as a normal quit.
+    if kind:
+        return "ended"
+    if clean is False:
+        return "crashed"
+    return None
 
 
 def _copy_private(src, dest):
@@ -1658,9 +1667,13 @@ def install_chromium_session(user_data, profile, running=False, enabled=True):
         return False, "no-profile"
     if running:
         return False, "already-running"
-    clean = chromium_clean_exit(user_data, profile)
-    if clean is not True:
-        return False, "clean-exit" if clean is False else "exit-unknown"
+    kind = chromium_exit_kind(user_data, profile)
+    # Crashed: Chrome's own file still lists every window. Anything else
+    # (Normal, SessionEnded, unreadable) has usually dropped all but the last.
+    if kind == "crashed":
+        return False, "crashed-exit"
+    if kind is None:
+        return False, "exit-unknown"
     src = chrome_sidecar_dir(user_data, profile)
     session_src, tabs_src = os.path.join(src, "Session"), os.path.join(src, "Tabs")
     if not (snss_header_ok(session_src) and snss_header_ok(tabs_src)):
@@ -1734,6 +1747,199 @@ def with_restore_last_session(argv):
     if b not in CHROMIUM_USER_DATA:
         return list(argv)
     return list(argv) + ["--restore-last-session"]
+
+
+def distinctive_name(title):
+    """A window name specific enough to aim a workspace rule at one window."""
+    key = browser_title_key(title)
+    return bool(key) and len(key) >= 4 and key not in _GENERIC_TITLE
+
+
+def window_name_score(saved, live):
+    """How well a live window's name matches a saved one.
+
+    xdgTag is the app's stable name. initialTitle is the name Hyprland
+    recorded when the window was created; the live title often changes
+    after that (unread counts, "Gmail" while a mailbox is still loading).
+    """
+    tag = (saved.get("xdg_tag") or "").strip()
+    live_tag = (live.get("xdgTag") or live.get("xdg_tag") or "").strip()
+    if tag and live_tag and tag == live_tag:
+        return 1.0
+    scores = [title_similarity(saved.get("title"), live.get("title"))]
+    initial = saved.get("initial_title") or ""
+    live_initial = live.get("initialTitle") or live.get("initial_title") or ""
+    if distinctive_name(initial):
+        scores.append(title_similarity(initial, live.get("title")))
+        if distinctive_name(live_initial):
+            scores.append(title_similarity(initial, live_initial))
+    if distinctive_name(live_initial):
+        scores.append(title_similarity(saved.get("title"), live_initial))
+    return max(scores) if scores else 0.0
+
+
+def match_windows_by_name(saved, clients, threshold=_TITLE_ACCEPT):
+    """Pair saved windows to live ones by name. Returns (saved_i, client_i, score)."""
+    scored = []
+    for si, w in enumerate(saved):
+        for ci, c in enumerate(clients):
+            if (w.get("class") or "").lower() != (c.get("class") or "").lower():
+                continue
+            wp, cp = w.get("profile") or "", c.get("profile") or ""
+            if wp and cp and wp != cp:
+                continue
+            scored.append((window_name_score(w, c), si, ci))
+    used_s, used_c, pairs = set(), set(), []
+    for score, si, ci in sorted(scored, key=lambda row: row[0], reverse=True):
+        if score < threshold or si in used_s or ci in used_c:
+            continue
+        used_s.add(si)
+        used_c.add(ci)
+        pairs.append((si, ci, score))
+    # A window still named "Gmail" or "JLCPCB" will not clear the strict
+    # threshold against the full saved title. Take it when it is the only
+    # window left for that class and profile.
+    by_s, by_c = {}, {}
+    for si, w in enumerate(saved):
+        if si in used_s:
+            continue
+        by_s.setdefault(((w.get("class") or "").lower(), w.get("profile") or ""), []).append(si)
+    for ci, c in enumerate(clients):
+        if ci in used_c:
+            continue
+        cp = c.get("profile") or ""
+        key_cls = (c.get("class") or "").lower()
+        if cp:
+            keys = [(key_cls, cp)]
+        else:
+            keys = [(cls, prof) for (cls, prof) in by_s if cls == key_cls]
+            if len(keys) != 1:
+                continue
+        for key in keys:
+            by_c.setdefault(key, []).append(ci)
+    for key, sis in by_s.items():
+        cis = by_c.get(key) or []
+        if len(sis) != 1 or len(cis) != 1:
+            continue
+        si, ci = sis[0], cis[0]
+        if ci in used_c or si in used_s:
+            continue
+        if not (only_candidate_match(saved[si].get("title"), clients[ci].get("title"))
+                or only_candidate_match(saved[si].get("initial_title") or "", clients[ci].get("initialTitle") or clients[ci].get("title") or "")):
+            continue
+        used_s.add(si)
+        used_c.add(ci)
+        pairs.append((si, ci, window_name_score(saved[si], clients[ci])))
+    return pairs
+
+
+def title_regex(text):
+    """Anchor a window name so a Hyprland regex matches that name only."""
+    return "^" + re.escape(text or "") + "$"
+
+
+def name_rule_specs(sess):
+    """One workspace rule per distinct window name.
+
+    A repeated name is skipped: two windows titled the same thing cannot
+    both be sent to different workspaces by a single rule.
+    """
+    seen = {}
+    for it in sess.get("items") or []:
+        cls = it.get("class") or ""
+        if not cls:
+            continue
+        for w in it.get("windows") or []:
+            tag = (w.get("xdg_tag") or "").strip()
+            initial = w.get("initial_title") or ""
+            title = w.get("title") or ""
+            if tag:
+                field, value = "xdg_tag", tag
+            elif distinctive_name(initial):
+                field, value = "initial_title", initial
+            elif distinctive_name(title):
+                field, value = "initial_title", title
+            else:
+                continue
+            ident = (cls.lower(), field, value)
+            row = (cls, field, value, ws_selector(w))
+            if ident in seen and seen[ident] != row:
+                seen[ident] = None
+            elif ident not in seen:
+                seen[ident] = row
+    specs = []
+    for ident, row in seen.items():
+        if not row:
+            continue
+        cls, field, value, ws = row
+        specs.append({
+            "name": f"omarchy-sr-{len(specs)}",
+            "class": cls,
+            "field": field,
+            "pattern": title_regex(value),
+            "label": value,
+            "workspace": ws,
+        })
+    return specs
+
+
+def lua_window_rule(spec):
+    """Lua that tells Hyprland to open this named window on its workspace.
+
+    The window name is inside the Lua source. Callers must send it over the
+    Hyprland socket, not as a hyprctl argument: process arguments are visible
+    to other local accounts, same as notify-send.
+    """
+    return (
+        "hl.window_rule({ "
+        f"name = {lua_long(spec['name'])}, "
+        "match = { "
+        f"class = {lua_long(title_regex(spec['class']))}, "
+        f"{spec['field']} = {lua_long(spec['pattern'])} "
+        "}, "
+        f"workspace = {lua_long(str(spec['workspace']) + ' silent')} "
+        "})"
+    )
+
+
+def lua_window_rule_off(name):
+    return (
+        "hl.window_rule({ "
+        f"name = {lua_long(name)}, enabled = false, workspace = {lua_long('unset')} "
+        "})"
+    )
+
+
+def hypr_eval(code, timeout=5):
+    """Evaluate Lua inside Hyprland. The code is written to the user's socket,
+    not placed on a process command line."""
+    sig = instance_sig()
+    if not sig:
+        return 127, "no hyprland instance"
+    rt = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    path = os.path.join(rt, "hypr", sig, ".socket.sock")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(path)
+        s.sendall(("eval " + code).encode())
+        try:
+            s.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        chunks = []
+        while True:
+            buf = s.recv(65536)
+            if not buf:
+                break
+            chunks.append(buf)
+        out = b"".join(chunks).decode(errors="replace")
+    except OSError as e:
+        return 127, str(e)
+    finally:
+        s.close()
+    ok = "ok" in out.lower() and "error" not in out.lower()
+    return (0 if ok else 1), out
 
 
 def chromium_user_data(pbase, pexe, pargv, class_hint=""):
@@ -1898,6 +2104,11 @@ def window_record(c):
     grouped = c.get("grouped") or []
     return {
         "title": c.get("title", ""),
+        # initialTitle is the name Hyprland saw when the window was created.
+        # xdgTag is the app's own stable name (xdg-toplevel-tag), when it sets one.
+        # Both survive a title that later grows an unread count.
+        "initial_title": c.get("initialTitle") or "",
+        "xdg_tag": c.get("xdgTag") or "",
         "workspace": ws.get("id"),
         "ws_name": ws.get("name", ""),
         "monitor": c.get("monitor"),
@@ -2867,6 +3078,19 @@ class Restorer:
         if got == target:
             log(f"restore: workspace move class={cls} addr={addr} now on {got} after focus")
             return True
+        # Numeric id "5" and the workspace's name are not always the same
+        # selector. Retry with the saved workspace name before giving up.
+        ws_name = str(w.get("ws_name") or "").strip()
+        if ws_name and not str(target).startswith("name:") and not str(target).startswith("special:"):
+            named = "name:" + ws_name
+            log(f"restore: workspace move class={cls} addr={addr} retry by workspace name {named}")
+            self._focus(addr)
+            dispatch(f"hl.dsp.window.move({{ workspace = {lua_long(named)}, follow = false, window = {sel} }})")
+            now = self._client(addr)
+            got = self._client_ws(now) if now else ""
+            if got == target or got == named or (now and str((now.get("workspace") or {}).get("name") or "") == ws_name):
+                log(f"restore: workspace move class={cls} addr={addr} now on {got or ws_name} via name")
+                return True
         # Last resort when this window is already alone in its scrolling column.
         # movecoltoworkspace moves the whole column; using it on a shared column
         # would drag the other windows onto this workspace and pile them up.
@@ -3079,11 +3303,18 @@ class Restorer:
             if not self.pending:
                 break
             addrs = {c.get("address") for c in self.clients()}
-            if addrs != last_addrs:
+            changed = addrs != last_addrs
+            if changed:
                 last_change = time.time()
                 last_addrs = addrs
                 self._extend_browser_deadlines()
-            elif time.time() - last_change >= settle:
+            names = tuple(sorted(
+                (c.get("address"), c.get("title") or "", (c.get("workspace") or {}).get("id"))
+                for c in self.clients()))
+            if names != getattr(self, "_name_sig", None):
+                self._name_sig = names
+                self.place_named_windows()
+            if not changed and time.time() - last_change >= settle:
                 for g in list(self.pending):
                     if g.get("kind") != "browser" or g.get("reopen_stop"):
                         continue
@@ -3230,9 +3461,117 @@ class Restorer:
             log(f"restore: order workspace {ws} layout=scrolling FAILED "
                 "(windows still share a column or left-to-right order disagrees)")
 
+    def _install_name_rules(self, sess):
+        """Ask Hyprland to open each named window on its saved workspace.
+
+        The rule matches the window's name (xdg tag, or the title Hyprland
+        sees at creation). It is installed before anything is launched, so a
+        Chrome window that appears late still lands on workspace 4 instead of
+        the workspace that happens to be showing. Rules are removed at the end.
+        """
+        self._rule_names = []
+        hypr_eval(
+            "for i = 0, 31 do "
+            "hl.window_rule({ name = 'omarchy-sr-' .. i, enabled = false, workspace = 'unset' }) "
+            "end"
+        )
+        specs = name_rule_specs(sess)
+        if not specs:
+            log("restore: no distinctive window names for workspace rules")
+            return
+        for spec in specs:
+            rc, _out = hypr_eval(lua_window_rule(spec))
+            self._rule_names.append(spec["name"])
+            # The name itself stays in the mode-600 log, not in a notification
+            # and not on a process command line.
+            if rc == 0:
+                log(f"restore: name rule {spec['name']} class={spec['class']} "
+                    f"by {spec['field']} name={clip_title(spec.get('label') or '')!r} "
+                    f"-> workspace {spec['workspace']}")
+            else:
+                log(f"restore: name rule {spec['name']} failed ({rc}); will place by name after the window appears")
+
+    def _clear_name_rules(self):
+        names = list(getattr(self, "_rule_names", []) or [])
+        if not names:
+            return
+        body = " ".join(lua_window_rule_off(name) for name in names)
+        hypr_eval(body)
+        self._rule_names = []
+
+    def place_named_windows(self):
+        """Move windows that are still on the wrong workspace, matched by name.
+
+        This runs again whenever a title changes, so a window that opened on
+        workspace 1 as \"Gmail\" and later became the real mailbox is moved
+        once its name is recognizable.
+        """
+        sess = getattr(self, "sess", None)
+        if not sess:
+            return 0
+        saved = []
+        for it in sess.get("items") or []:
+            cls = it.get("class") or ""
+            prof = it.get("profile") or ""
+            for w in it.get("windows") or []:
+                saved.append({
+                    "class": cls, "profile": prof, "window": w,
+                    "title": w.get("title") or "",
+                    "initial_title": w.get("initial_title") or "",
+                    "xdg_tag": w.get("xdg_tag") or "",
+                })
+        live = []
+        for c in self.clients():
+            live.append({
+                "address": c.get("address"),
+                "title": c.get("title") or "",
+                "initialTitle": c.get("initialTitle") or "",
+                "xdgTag": c.get("xdgTag") or "",
+                "class": c.get("class") or c.get("initialClass") or "",
+                "profile": self._profile_of_client(c),
+                "raw": c,
+            })
+        moved = 0
+        tried = getattr(self, "_name_tried", None)
+        if tried is None:
+            self._name_tried = tried = set()
+        for si, ci, score in match_windows_by_name(saved, live):
+            w = saved[si]["window"]
+            raw = live[ci]["raw"]
+            addr = raw.get("address")
+            target = ws_selector(w)
+            cur = self._client_ws(raw)
+            if cur == target:
+                continue
+            # One attempt per live title. A loading name ("Gmail") and the
+            # later mailbox name each get a move; a 150s wait does not repeat.
+            attempt = (addr, target, raw.get("title") or "")
+            if attempt in tried:
+                continue
+            tried.add(attempt)
+            cls = saved[si]["class"]
+            shown = raw.get("title") or raw.get("initialTitle") or ""
+            log(f"restore: name place class={cls} score={score:.2f} {cur or '?'} -> {target} "
+                f"name={clip_title(shown)!r}")
+            if self._move_to_workspace(raw, w, cls):
+                moved += 1
+                self.placed_at[addr] = w
+                self.claimed.add(addr)
+            else:
+                self.failed.append(cls)
+        return moved
+
     def run(self, sess):
         self.sess = sess
         self.monitors_now = hypr_json("monitors")
+        self._name_tried = set()
+        self._install_name_rules(sess)
+        try:
+            return self._run_body(sess)
+        finally:
+            self._clear_name_rules()
+
+    def _run_body(self, sess):
         try:
             apply_workspace_layouts(sess)
         except Exception as e:
@@ -3320,6 +3659,7 @@ class Restorer:
                 log(f"restore: {cls}: {e!r}")
                 self.failed.append(cls)
         self.wait_pending()
+        self.place_named_windows()
         self.reorder_tiled(sess)
         if self.refocus and self.prev_focus:
             dispatch(f"hl.dsp.focus({{ window = {lua_long('address:' + self.prev_focus)} }})")

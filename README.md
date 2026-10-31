@@ -14,7 +14,7 @@ quietly and restores once on the next login.
 | | |
 |---|---|
 | **Plugin id** | `eric.session-restore` |
-| **Version** | 1.3.1 |
+| **Version** | 1.3.2 |
 | **License** | MIT |
 | **Author** | Eric Westphal &lt;BonanzaEric@gmail.com&gt; |
 | **Based on** | [wbarakat/omarchy-session-restore](https://github.com/wbarakat/omarchy-session-restore) (MIT, © 2026 Waleed) |
@@ -208,7 +208,15 @@ own windows. If something is still missing after new windows stop appearing,
 the plugin sends Chrome's reopen-closed-window shortcut (the same action as
 History → recently closed), once per missing window.
 
-Each matched window is moved to its saved workspace, and the move is checked.
+Each window is placed by its name: the XDG tag when the app sets one,
+otherwise the title Hyprland saw when the window was created (`initialTitle`),
+otherwise the current title. Before launch, a temporary Hyprland rule opens
+that named window on its saved workspace, so a late Chrome window does not
+sit on workspace 1 until something moves it. The rule is removed when restore
+finishes. A later pass moves any window whose name is recognizable but which
+is still on the wrong workspace. The move is checked, and if the numeric
+workspace id does not stick, it is retried with the workspace's name.
+
 Tiled windows are then ordered left to right. On the scrolling layout each
 window is given its own column; a directional "swap right" is not used,
 because that dispatcher has no neighbor there and leaves the windows stacked.
