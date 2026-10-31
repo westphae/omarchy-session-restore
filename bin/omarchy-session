@@ -43,7 +43,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 FORMAT = 1
 HOME = os.path.expanduser("~")
 XDG_STATE = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state")
@@ -105,7 +105,8 @@ TERMINALS = {
     # A single-instance ghostty hands new windows to the running instance over
     # D-Bus and drops --working-directory, so restored windows run standalone.
     "ghostty": dict(classes=["com.mitchellh.ghostty", "ghostty"], dir=("eq", "--working-directory"), exec="-e",
-                    drop=["--gtk-single-instance"], add=["--gtk-single-instance=false"]),
+                    drop=["--gtk-single-instance"], add=["--gtk-single-instance=false"],
+                    class_flag="--class"),
     "kitty": dict(classes=["kitty"], dir=("sep", "--directory"), exec=None, drop=["-1", "--single-instance", "--instance-group"]),
     "alacritty": dict(classes=["alacritty", "Alacritty"], dir=("sep", "--working-directory"), exec="-e"),
     "foot": dict(classes=["foot"], dir=("eq", "--working-directory"), exec=None),
@@ -661,13 +662,73 @@ def cmdline(pid):
     if not raw:
         return []
     parts = [a.decode(errors="surrogateescape") for a in raw.split(b"\0") if a != b""]
-    # Some Chromium launches leave one concatenated argv string (spaces, no NULs).
+    # Chrome sometimes rewrites argv into one space-joined string with no NULs.
     if len(parts) == 1 and (" --" in parts[0] or parts[0].count(" ") >= 2):
-        try:
-            parts = shlex.split(parts[0])
-        except ValueError:
-            parts = parts[0].split()
+        return split_joined_argv(parts[0])
     return parts
+
+
+def split_joined_argv(blob):
+    """Split a NUL-less cmdline without breaking flag values that contain spaces.
+
+    shlex.split("--profile-directory=Profile 1 --restore-last-session") yields
+    "--profile-directory=Profile" and "1", because the value was never quoted.
+    A new flag is whitespace followed by "--"; the value may contain spaces
+    until that point.
+    """
+    blob = (blob or "").strip()
+    if not blob:
+        return []
+    if " --" in blob or blob.startswith("--"):
+        return [p for p in re.split(r"\s+(?=--)", blob) if p]
+    try:
+        return shlex.split(blob)
+    except ValueError:
+        return blob.split()
+
+
+def profile_from_argv(argv):
+    for a in argv or []:
+        if isinstance(a, str) and a.startswith("--profile-directory="):
+            return a.split("=", 1)[1]
+    return ""
+
+
+def profile_from_window_class(cls):
+    """Profile embedded in a PWA class, e.g. chrome-<app>-Profile_1."""
+    m = WEBAPP_CLASS.match(cls or "")
+    if not m:
+        return ""
+    return m.group("profile").replace("_", " ")
+
+
+def saved_browser_profiles(sess, cls):
+    out = []
+    for it in (sess or {}).get("items") or []:
+        if it.get("kind") != "browser":
+            continue
+        if (it.get("class") or "").lower() != (cls or "").lower():
+            continue
+        prof = it.get("profile") or ""
+        if prof:
+            out.append(prof)
+    return out
+
+
+def client_profile(process_profile, cls, saved_profiles):
+    """Profile to use when matching a live window.
+
+    A PWA class names its profile. Ordinary Chrome windows do not: every
+    profile's windows share one browser process, and --profile-directory on
+    that process only names whichever profile was launched first. With more
+    than one saved profile, ignore the process and match by title.
+    """
+    embedded = profile_from_window_class(cls)
+    if embedded:
+        return embedded
+    if len(set(saved_profiles or [])) > 1:
+        return ""
+    return process_profile or ""
 
 
 def exe_of(pid):
@@ -1291,6 +1352,28 @@ def terminal_base_argv(term_key, spec, pargv, desk_entry):
         if a.startswith("--") and "=" in a or a in keep:
             out.append(a)
     return out
+
+
+def ensure_terminal_class(argv, cls, spec=None):
+    """Keep a custom app id such as org.omarchy.terminal on the relaunch.
+
+    Omarchy's floating terminal is ghostty with a different class. Without
+    --class= the new window shows up as com.mitchellh.ghostty and the restore
+    waits for a class that never appears.
+    """
+    argv = list(argv or [])
+    if not argv or not cls or not spec:
+        return argv
+    defaults = {x.lower() for x in spec.get("classes") or []}
+    if cls.lower() in defaults:
+        return argv
+    flag = spec.get("class_flag") or ""
+    if not flag:
+        return argv
+    if any(a == flag or a.startswith(flag + "=") for a in argv):
+        return argv
+    argv.insert(1, f"{flag}={cls}")
+    return argv
 
 
 def terminal_launch(term_key, spec, base_argv, cwd, resume, default_ids, desk_entry):
@@ -2293,12 +2376,16 @@ def snapshot(cfg):
                     for t in [sh] + sorted(extra.get(wi, []), key=lambda t: t["start"]):
                         tabs.append({"cwd": t["cwd"], "atuin": t["atuin"], "hooked": t["hooked"],
                                      "resume": t["resume"], "label": t["label"],
-                                     "argv": terminal_launch(term_key, spec, base_argv, t["cwd"], t["resume"],
-                                                             default_ids, tdesk)})
+                                     "argv": ensure_terminal_class(
+                                         terminal_launch(term_key, spec, base_argv, t["cwd"], t["resume"],
+                                                         default_ids, tdesk),
+                                         cls, spec)})
+                    plain = ensure_terminal_class(
+                        terminal_launch(term_key, spec, base_argv, sh["cwd"], None, default_ids, tdesk),
+                        cls, spec)
                     items.append({"kind": "terminal", "class": cls, "term": term_key,
                                   "argv": tabs[0]["argv"], "cwd": sh["cwd"], "resume": sh["resume"],
-                                  "plain_argv": terminal_launch(term_key, spec, base_argv, sh["cwd"], None,
-                                                                default_ids, tdesk),
+                                  "plain_argv": plain,
                                   "tabs": tabs,
                                   "strategy": f"{term_key} working-directory flag" if spec else "generic terminal",
                                   "windows": [window_record(c)]})
@@ -3167,21 +3254,24 @@ class Restorer:
             log(f"restore: could not split scrolling column class={cls} addr={address} shared_with={len(mates)}")
             return
 
-    def _profile_of_client(self, c):
+    def _process_profile(self, c):
+        """--profile-directory from the browser process, if it can be read."""
         pid = c.get("pid") or 0
         if not pid:
             return ""
         if pid in self._prof_cache:
             return self._prof_cache[pid]
         mp = main_process(pid)
-        prof = ""
-        for a in cmdline(mp):
-            if a.startswith("--profile-directory="):
-                prof = a.split("=", 1)[1]
-                break
+        prof = profile_from_argv(cmdline(mp))
         self._prof_cache[pid] = prof
         self._prof_cache[mp] = prof
         return prof
+
+    def _profile_of_client(self, c):
+        cls = c.get("class") or c.get("initialClass") or ""
+        return client_profile(
+            self._process_profile(c), cls,
+            saved_browser_profiles(getattr(self, "sess", None), cls))
 
     def _match_client(self, c):
         return {
@@ -3241,6 +3331,36 @@ class Restorer:
         for addr in leftover_claim_ids(g.get("profile") or "", g["class"], others, clients):
             self.claimed.add(addr)
 
+    def _reopen_target(self, g):
+        """Window that should receive Ctrl+Shift+T for this profile.
+
+        With several Chrome profiles in one process, the process profile is
+        unknown. Pick a window whose title belongs to this profile. Sending
+        the shortcut to the other profile's window restores the wrong session.
+        """
+        want = g.get("profile") or ""
+        titles = [w.get("title") or "" for w in (g.get("windows") or g.get("remaining") or [])]
+        best, best_s = None, 0.0
+        for c in self.clients():
+            if (c.get("class") or c.get("initialClass") or "").lower() != (g.get("class") or "").lower():
+                continue
+            cp = self._profile_of_client(c)
+            if want and cp and cp != want:
+                continue
+            score = 0.0
+            for title in titles:
+                score = max(score, title_similarity(title, c.get("title")),
+                            title_similarity(title, c.get("initialTitle")))
+            if want and cp == want and score >= best_s:
+                best, best_s = c, max(score, best_s)
+            elif not cp and score > best_s:
+                best, best_s = c, score
+        if best is None:
+            return None
+        if best_s >= 0.5 or (want and self._profile_of_client(best) == want):
+            return best
+        return None
+
     def _reopen_closed_window(self, g):
         """Ctrl+Shift+T — Chrome's reopen-closed-window shortcut — once.
 
@@ -3251,16 +3371,7 @@ class Restorer:
         """
         if g.get("reopen_stop"):
             return False
-        target = None
-        for c in self.clients():
-            if (c.get("class") or c.get("initialClass") or "").lower() != (g.get("class") or "").lower():
-                continue
-            cp = self._profile_of_client(c)
-            if g.get("profile") and cp and cp != g["profile"]:
-                continue
-            target = c
-            if g.get("profile") and cp == g["profile"]:
-                break
+        target = self._reopen_target(g)
         if not target:
             log(f"restore: reopen skipped class={g.get('class')} profile={g.get('profile') or '-'} "
                 "(no window of this profile to send the shortcut to)")
@@ -3623,7 +3734,7 @@ class Restorer:
                     reopen_after = now + (max(settle * 3, min(45, wait // 2)) if snapshot else settle)
                     self.pending.append({
                         "class": cls, "kind": "browser", "profile": prof,
-                        "remaining": list(wins), "snapshot": snapshot,
+                        "windows": list(wins), "remaining": list(wins), "snapshot": snapshot,
                         "deadline": now + wait, "deadline_cap": now + wait + wait // 2,
                         "reopen_after": reopen_after, "reopen_attempts": 0,
                         "reopen_budget": len(wins), "reopen_stop": False,
@@ -3684,14 +3795,16 @@ class Restorer:
         groups = [tabs] if as_tabs else [[t] for t in tabs]
         for gi, group in enumerate(groups):
             q = None
+            spec = TERMINALS.get(it.get("term") or "")
             if use_hook:
                 q = make_queue(group)
                 orig, g0 = it.get("cwd") or HOME, group[0]["cwd"]
                 plain = [g0 if a == orig else (a[:-len(orig)] + g0 if a.endswith("=" + orig) else a)
                          for a in it["plain_argv"]]
+                plain = ensure_terminal_class(plain, cls, spec)
                 argv = ["env", f"OMARCHY_SR_QUEUE={q}", f"OMARCHY_SR_BIN={SELF}"] + plain
             else:
-                argv = group[0]["argv"]
+                argv = ensure_terminal_class(group[0]["argv"], cls, spec)
             try:
                 if not self.launch(argv, ws):
                     self.failed.append(cls)

@@ -276,6 +276,55 @@ class NamePlacementTests(unittest.TestCase):
             self.assertEqual(f.read(), b"SNSS-ended")
 
 
+class ArtooLogTests(unittest.TestCase):
+    """The 2026-10-31 reboot: titles matched and were still dropped."""
+
+    CHROME = (
+        "/usr/bin/google-chrome-stable --disable-accelerated-video-decode "
+        "--profile-directory=Profile 1 --restore-last-session"
+    )
+
+    def test_joined_cmdline_keeps_profile_1(self):
+        argv = m.split_joined_argv(self.CHROME)
+        self.assertIn("--profile-directory=Profile 1", argv)
+        self.assertEqual(m.profile_from_argv(argv), "Profile 1")
+        self.assertNotIn("--profile-directory=Profile", argv)
+
+    def test_shared_process_profile_is_unknown_when_two_profiles_are_saved(self):
+        self.assertEqual(m.client_profile("Profile 1", "google-chrome", ["Default", "Profile 1"]), "")
+        self.assertEqual(m.client_profile("Profile", "google-chrome", ["Default", "Profile 1"]), "")
+        self.assertEqual(m.client_profile("Default", "google-chrome", ["Default"]), "Default")
+        self.assertEqual(
+            m.client_profile("Profile 1", "chrome-ilbcbhpbmggihnbldpmmbppiclfnifck-Default", ["Default", "Profile 1"]),
+            "Default")
+
+    def test_exact_titles_match_once_the_bogus_profile_is_ignored(self):
+        youtube = "SpaceX Has Never Moved This Fast With Starship! - YouTube - Google Chrome"
+        metar = "METAR KCXO - Conroe/North Houston Regional Airport - Google Chrome"
+        docs = "Elon Musk (Isaacson) – Book Club Discussion Guide, Nov 1, 2026 - Google Docs - Google Chrome"
+        saved = [{"title": youtube}, {"title": metar}, {"title": docs}]
+        clients = [
+            {"title": "(28) " + youtube, "profile": "", "address": "y"},
+            {"title": metar, "profile": "", "address": "m"},
+            {"title": docs, "profile": "", "address": "d"},
+            {"title": "agenda - Google Chrome", "profile": "", "address": "a"},
+        ]
+        blocked, blocked_notes = m.match_saved_windows(
+            saved, [dict(c, profile="Profile") for c in clients], "Default")
+        self.assertEqual(blocked, [])
+        self.assertEqual(blocked_notes[0]["profile_candidates"], 0)
+        pairs, notes = m.match_saved_windows(saved, clients, "Default")
+        self.assertEqual(notes, [])
+        self.assertEqual({clients[ci]["address"] for _w, ci, _s in pairs}, {"y", "m", "d"})
+
+    def test_omarchy_terminal_keeps_its_class(self):
+        argv = ["ghostty", "--gtk-single-instance=false", "--working-directory=/home/eric"]
+        out = m.ensure_terminal_class(argv, "org.omarchy.terminal", m.TERMINALS["ghostty"])
+        self.assertIn("--class=org.omarchy.terminal", out)
+        plain = m.ensure_terminal_class(argv, "com.mitchellh.ghostty", m.TERMINALS["ghostty"])
+        self.assertNotIn("--class=com.mitchellh.ghostty", plain)
+
+
 class NotifyTests(unittest.TestCase):
     def test_unmatched_titles_do_not_fit_in_a_notification(self):
         # The notification builder rejects anything that is not a count.

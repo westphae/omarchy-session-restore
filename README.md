@@ -14,7 +14,7 @@ quietly and restores once on the next login.
 | | |
 |---|---|
 | **Plugin id** | `eric.session-restore` |
-| **Version** | 1.3.2 |
+| **Version** | 1.3.3 |
 | **License** | MIT |
 | **Author** | Eric Westphal &lt;BonanzaEric@gmail.com&gt; |
 | **Based on** | [wbarakat/omarchy-session-restore](https://github.com/wbarakat/omarchy-session-restore) (MIT, © 2026 Waleed) |
@@ -195,12 +195,20 @@ Chrome (and Chromium-family browsers):
 Do that once per profile you care about. This plugin launches each profile
 with `--profile-directory=…` and `--restore-last-session`.
 
-A normal logout closes Chrome's windows one by one, and Chrome then remembers
-only the last window of each profile. On every save that changes the window
-list, and on the final pre-logout save, the plugin keeps a private copy of
-that profile's Chrome session files. After a **clean** exit it puts that copy
-back before launch, so every window comes back. A crash is left alone —
+A normal logout, and a reboot that Chrome records as `SessionEnded`, closes
+windows one by one, so Chrome then remembers only the last window of each
+profile. On every save that changes the window list, and on the final
+pre-logout save, the plugin keeps a private copy of that profile's Chrome
+session files and puts that copy back before launch. A crash is left alone —
 Chrome's own file still has the full session.
+
+Several Chrome profiles share one browser process. The process's
+`--profile-directory` only names the profile that was launched first, and
+Chrome sometimes rewrites that argument as an unquoted `Profile 1`. With more
+than one saved profile, windows are matched by title instead of by that flag.
+A terminal whose class is not the emulator's own (Omarchy's floating terminal
+is `org.omarchy.terminal` on top of ghostty) is relaunched with `--class=`
+so the new window is the one restore is waiting for.
 
 Windows are matched to workspaces by title. Unread counts and a shortened
 tab title (`JLCPCB`, `Gmail`) still match, and each profile only takes its
