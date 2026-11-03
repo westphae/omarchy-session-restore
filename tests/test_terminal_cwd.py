@@ -182,3 +182,62 @@ class AssignTerminalCwdTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OneShotAndDuplicateTabTests(unittest.TestCase):
+    """Reboot from the Omarchy update window; herdr attached in two tabs."""
+
+    def test_one_shot_shells(self):
+        upd = ["bash", "-c", "omarchy-show-logo; omarchy-update; code=$?; "
+               "if (( code != 130 )); then omarchy-show-done $code; fi"]
+        self.assertTrue(m.shell_runs_command(upd))
+        self.assertTrue(m.shell_runs_command(["/bin/bash", "-lc", "make"]))
+        self.assertTrue(m.shell_runs_command(["/bin/bash", "/usr/bin/omarchy-update"]))
+        self.assertTrue(m.shell_runs_command(["bash", "--rcfile", "x", "script.sh"]))
+
+    def test_interactive_shells_and_our_wrapper(self):
+        for argv in (["bash"], ["-bash"], ["/bin/bash", "--posix"], ["bash", "-l"],
+                     ["bash", "-i", "-c", "x"], ["zsh", "-o", "foo"], ["fish", "--login"],
+                     ["bash", "--rcfile", "/tmp/rc"],
+                     ["/bin/bash", "-c", '"$@"; exec "${SHELL:-/bin/bash}"', "omarchy-session", "herdr"]):
+            self.assertFalse(m.shell_runs_command(argv), argv)
+        self.assertFalse(m.shell_runs_command(["vim", "-c", "x"]))
+
+    def test_persistent_attach(self):
+        self.assertTrue(m.attaches_persistent_session(["herdr"]))
+        self.assertTrue(m.attaches_persistent_session(["tmux", "new-session", "-A", "-s", "main"]))
+        self.assertTrue(m.attaches_persistent_session(["zellij", "attach", "x"]))
+        self.assertFalse(m.attaches_persistent_session(["tmux"]))
+        self.assertFalse(m.attaches_persistent_session(["nvim", "a.txt"]))
+        self.assertFalse(m.attaches_persistent_session(None))
+
+    def test_dedupe_tabs(self):
+        tabs = [{"cwd": "/home/user", "resume": ["herdr"]},
+                {"cwd": "/home/user", "resume": None},
+                {"cwd": "/home/user", "resume": ["herdr"]},
+                {"cwd": "/tmp", "resume": ["nvim"]},
+                {"cwd": "/tmp", "resume": ["nvim"]}]
+        out, dropped = m.dedupe_terminal_tabs(tabs)
+        self.assertEqual(len(out), 4)
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual(out[0]["resume"], ["herdr"])
+
+    def test_normalize_old_save(self):
+        tab = lambda a, r: {"cwd": "/home/user", "atuin": a, "hooked": True, "resume": r,
+                            "label": "", "argv": ["ghostty"]}
+        sess = {"items": [
+            {"kind": "terminal", "class": "com.mitchellh.ghostty", "argv": ["ghostty"],
+             "windows": [{"title": "host: agenda", "initial_title": "Ghostty"}],
+             "tabs": [tab("e56177", ["herdr"]), tab("210698", ["herdr"])]},
+            {"kind": "terminal", "class": "org.omarchy.terminal", "argv": ["ghostty"],
+             "windows": [{"title": "Omarchy", "initial_title": "Omarchy", "floating": True}],
+             "tabs": [tab("", None)]},
+            {"kind": "terminal", "class": "org.omarchy.terminal", "argv": ["ghostty"],
+             "windows": [{"title": "~", "initial_title": "~", "floating": True}],
+             "tabs": [tab("", None)]},
+        ]}
+        out = m.normalize_session(sess)
+        self.assertEqual(len(out["items"]), 2)
+        self.assertEqual(len(out["items"][0]["tabs"]), 1)
+        self.assertEqual(out["items"][1]["windows"][0]["title"], "~")
+        self.assertEqual(out["skipped"][0]["class"], "org.omarchy.terminal")
