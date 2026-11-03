@@ -43,7 +43,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "1.3.4"
+VERSION = "1.3.5"
 FORMAT = 1
 HOME = os.path.expanduser("~")
 XDG_STATE = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state")
@@ -802,6 +802,86 @@ def main_process(pid):
 
 def base(path):
     return os.path.basename(path or "")
+
+
+# Shell options that take a value, so the value is not mistaken for a script.
+_SHELL_OPT_ARGS = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file", "-C", "--command",
+                   "--init-command", "--config", "--env-config"}
+
+
+def shell_runs_command(argv):
+    """True when a shell is running a one-shot command or script, not a prompt.
+
+    `bash -c 'omarchy-show-logo; omarchy-update; ...'` (Omarchy's update and
+    install windows) or `bash /usr/bin/some-script` ends when the job ends;
+    relaunching that terminal after a reboot only leaves a stray empty shell.
+    The plugin's own resume wrapper (`sh -c '"$@"; exec $SHELL' omarchy-session
+    prog ...`) is not a one-shot command: it drops to a prompt afterwards.
+    """
+    argv = list(argv or [])
+    if not argv or base(argv[0]).lstrip("-") not in SHELLS:
+        return False
+    args = argv[1:]
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-c", "--command") or (a.startswith("-") and not a.startswith("--")
+                                         and len(a) > 1 and "c" in a[1:] and a not in _SHELL_OPT_ARGS):
+            rest = args[i + 1:]
+            return not (len(rest) >= 2 and rest[1] == "omarchy-session")
+        if a in ("-i", "--interactive"):
+            return False
+        if a == "--":
+            return i + 1 < len(args)
+        if a in _SHELL_OPT_ARGS:
+            i += 2
+            continue
+        if not a.startswith(("-", "+")):
+            return True  # a script path
+        i += 1
+    return False
+
+
+# Programs that attach to one persistent session no matter how often they are
+# started. Two tabs running the same attach show the same thing, so a restore
+# keeps one. Plain `tmux` / `zellij` start a new session each time; those stay.
+def attaches_persistent_session(resume):
+    if not resume:
+        return False
+    prog = base(resume[0])
+    rest = resume[1:]
+    if prog == "herdr":
+        return not rest or rest[0] in ("attach", "a") or all(a.startswith("-") for a in rest)
+    if prog == "tmux":
+        return "-A" in rest or any(a in ("attach", "attach-session", "a", "at") for a in rest[:1])
+    if prog == "zellij":
+        return any(a in ("attach", "a") for a in rest[:1])
+    if prog == "screen":
+        return any(a.startswith("-") and ("x" in a or "r" in a) for a in rest)
+    return False
+
+
+def dedupe_terminal_tabs(tabs):
+    """Drop tabs that re-run the same persistent-session attach as an earlier tab."""
+    out, seen, dropped = [], set(), []
+    for t in tabs or []:
+        r = t.get("resume")
+        if attaches_persistent_session(r):
+            key = tuple(r)
+            if key in seen:
+                dropped.append(t)
+                continue
+            seen.add(key)
+        out.append(t)
+    return out, dropped
+
+
+def is_omarchy_presentation_window(item):
+    """Omarchy's floating update/install window (`--title=Omarchy`, class
+    org.omarchy.terminal). It runs one command and closes; never restore it."""
+    if item.get("class") != "org.omarchy.terminal":
+        return False
+    return any((w.get("initial_title") or "") == "Omarchy" for w in item.get("windows") or [])
 
 
 def strip_deleted(path):
@@ -2573,6 +2653,16 @@ def snapshot(cfg):
                     plan = shell_plan.get(id(c)) or {
                         "cwd": HOME, "atuin": "", "hooked": False, "source": "home",
                         "shell_pid": None, "tab_pids": []}
+                    if plan.get("shell_pid") and shell_runs_command(cmdline(plan["shell_pid"])):
+                        skipped.append((cls, "one-shot command window (e.g. Omarchy update)"))
+                        continue
+                    if (not plan.get("shell_pid") and len(wins) == 1 and spec and spec.get("exec")
+                            and spec["exec"] in pargv
+                            and "omarchy-session" not in pargv[pargv.index(spec["exec"]) + 1:]
+                            and pargv.index(spec["exec"]) + 1 < len(pargv)
+                            and shell_runs_command(pargv[pargv.index(spec["exec"]) + 1:])):
+                        skipped.append((cls, "one-shot command window (e.g. Omarchy update)"))
+                        continue
                     if plan.get("shell_pid"):
                         try:
                             sh = shell_info(cfg, plan["shell_pid"])
@@ -2589,6 +2679,8 @@ def snapshot(cfg):
                               "start": 0}
                     extra = []
                     for tpid in plan.get("tab_pids") or []:
+                        if shell_runs_command(cmdline(tpid)):
+                            continue
                         try:
                             extra.append(shell_info(cfg, tpid))
                         except OSError:
@@ -2603,6 +2695,10 @@ def snapshot(cfg):
                                          terminal_launch(term_key, spec, base_argv, t["cwd"], t["resume"],
                                                          default_ids, tdesk),
                                          cls, spec)})
+                    tabs, dup = dedupe_terminal_tabs(tabs)
+                    if dup:
+                        log(f"save: {cls}: {len(dup)} duplicate tab(s) attached to the same "
+                            f"{base(dup[0]['resume'][0])} session not saved")
                     plain = ensure_terminal_class(
                         terminal_launch(term_key, spec, base_argv, sh["cwd"], None, default_ids, tdesk),
                         cls, spec)
@@ -2987,6 +3083,24 @@ def load_session(path):
             if (not isinstance(t, dict) or not isinstance(t.get("cwd"), str) or not valid_argv(t.get("argv"))
                     or not valid_argv(t.get("resume"), optional=True) or not isinstance(t.get("atuin", ""), str)):
                 raise ValueError(f"{path}: invalid tab {str(t)[:120]}")
+    return normalize_session(sess)
+
+
+def normalize_session(sess):
+    """Fix up saves written by older versions: drop Omarchy's one-shot update
+    window and duplicate tabs attached to the same persistent session."""
+    items = []
+    for it in sess["items"]:
+        if it.get("kind") == "terminal" and is_omarchy_presentation_window(it):
+            sess.setdefault("skipped", []).append(
+                {"class": it["class"], "reason": "one-shot command window (e.g. Omarchy update)"})
+            continue
+        if it.get("kind") == "terminal" and len(it.get("tabs") or []) > 1:
+            tabs, dup = dedupe_terminal_tabs(it["tabs"])
+            if dup:
+                it = dict(it, tabs=tabs)
+        items.append(it)
+    sess["items"] = items
     return sess
 
 

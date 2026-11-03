@@ -14,7 +14,7 @@ quietly and restores once on the next login.
 | | |
 |---|---|
 | **Plugin id** | `eric.session-restore` |
-| **Version** | 1.3.4 |
+| **Version** | 1.3.5 |
 | **License** | MIT |
 | **Author** | Eric Westphal &lt;BonanzaEric@gmail.com&gt; |
 | **Based on** | [wbarakat/omarchy-session-restore](https://github.com/wbarakat/omarchy-session-restore) (MIT, © 2026 Waleed) |
@@ -379,7 +379,15 @@ Permission-skipping flags are never added; one-shot runs (`claude -p`, …) are
 not restarted; no prompt is ever sent. Agents inside herdr are left to herdr.
 
 Without the hook, terminals still return in the shell's folder with the
-program and agent resumed, but each gets a new Atuin session and only one tab.
+program and agent resumed, but each gets a new Atuin session, and a Ghostty
+window's extra tabs open as separate windows on the same workspace.
+
+**Not restored.** Windows running a one-shot command — Omarchy's floating
+update or install window (`bash -c 'omarchy-update …'`), or any terminal
+started with `-e <script>` — are not saved; relaunching them would only leave
+an empty floating shell. Tabs that attach to the same persistent session
+(`herdr`, `tmux new -A -s …`, `zellij attach …`) come back once, not once per
+tab, since every copy would show the same session.
 
 ---
 
