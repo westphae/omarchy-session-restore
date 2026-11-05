@@ -43,7 +43,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "1.3.5"
+VERSION = "1.3.6"
 FORMAT = 1
 HOME = os.path.expanduser("~")
 XDG_STATE = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state")
@@ -1718,6 +1718,35 @@ _TITLE_ACCEPT_UNKNOWN_PROFILE = 0.88
 # Different mailboxes share the "Inbox (…) - …" shape. Cap that score under
 # every accept threshold so one profile cannot take the other's window.
 _TITLE_EMAIL_CONFLICT = 0.35
+# First-run / empty windows Chromium opens instead of the saved session.
+_NTP_LIKE_TITLES = frozenset({
+    "new tab", "what's new", "whats new", "chrome welcome", "welcome to chrome",
+    "welcome", "untitled",
+})
+
+
+def is_ntp_like_title(title):
+    """True for New Tab / What's New / empty Chromium placeholder titles.
+
+    Deliberately narrower than ``_GENERIC_TITLE``: a loading "Gmail" or
+    "Inbox" window is real content in progress, not a first-run placeholder.
+    """
+    key = browser_title_key(title)
+    if not key:
+        return True
+    if key in _NTP_LIKE_TITLES:
+        return True
+    # Bare browser chrome with no page title yet.
+    if key in ("google chrome", "chrome", "chromium", "brave",
+               "microsoft edge", "vivaldi", "helium"):
+        return True
+    if key.startswith("what's new") or key.startswith("whats new"):
+        return True
+    if key.startswith("welcome to"):
+        return True
+    return False
+
+
 _SNSS_MAGIC = b"SNSS"
 _SESSION_NAME_RE = re.compile(r"^(Session|Tabs|App)_(\d+)$")
 _CHROME_SESSION_MAX_BYTES = 80_000_000
@@ -1989,6 +2018,93 @@ def _copy_private(src, dest):
             pass
         raise
     return len(data) if isinstance(data, (bytes, bytearray)) else 0
+
+
+def chromium_browser_main_pids():
+    """PIDs of Chromium-family browser main processes (no --type= helpers)."""
+    out = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return out
+    for pid in entries:
+        if not pid.isdigit():
+            continue
+        argv = cmdline(pid)
+        if not argv or any(a.startswith("--type=") for a in argv):
+            continue
+        if base(argv[0]) not in CHROMIUM_USER_DATA:
+            continue
+        out.append(int(pid))
+    return out
+
+
+def sess_chromium_profiles(sess):
+    """Unique (user_data, profile) pairs for Chromium-family browser items."""
+    seen, out = set(), []
+    for it in sess.get("items") or []:
+        if it.get("kind") != "browser":
+            continue
+        prof = it.get("profile") or ""
+        argv = it.get("argv") or []
+        if not prof or not argv:
+            continue
+        ud = chromium_user_data(base(argv[0]), "", argv)
+        if not ud:
+            continue
+        try:
+            key = (os.path.realpath(ud), prof)
+        except OSError:
+            key = (ud, prof)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def quit_chromium_browsers(sess, timeout=10):
+    """SIGTERM Chromium-family browsers and wait for a clean Preferences exit.
+
+    Used only from ``save(--final)`` so reboot/logout does not leave
+    ``exit_type=Crashed``. Does not rewrite session.json. Returns a short
+    status string for the log.
+    """
+    targets = sess_chromium_profiles(sess)
+    pids = chromium_browser_main_pids()
+    if not pids:
+        return "no chromium browser process running"
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            log(f"save (final): sent SIGTERM to chromium pid={pid}")
+        except ProcessLookupError:
+            pass
+        except OSError as e:
+            log(f"save (final): cannot signal chromium pid={pid}: {e}")
+    deadline = time.time() + max(1.0, float(timeout))
+    status = "timeout"
+    while time.time() < deadline:
+        alive = [p for p in pids if os.path.exists(f"/proc/{p}")]
+        kinds = []
+        all_clean = True
+        for ud, prof in targets:
+            kind = chromium_exit_kind(ud, prof)
+            kinds.append(f"{prof}:{kind or 'unknown'}")
+            if kind not in ("normal", "ended"):
+                all_clean = False
+        if not alive:
+            status = "exited; " + (", ".join(kinds) if kinds else "no profiles")
+            break
+        if targets and all_clean:
+            status = "clean prefs while exiting; " + ", ".join(kinds)
+            break
+        time.sleep(0.2)
+    else:
+        alive = [p for p in pids if os.path.exists(f"/proc/{p}")]
+        kinds = [f"{prof}:{(chromium_exit_kind(ud, prof) or 'unknown')}" for ud, prof in targets]
+        status = f"timeout after {timeout}s; alive={alive}; " + (", ".join(kinds) if kinds else "no profiles")
+    return status
 
 
 def copy_chromium_sessions(sess):
@@ -2906,6 +3022,20 @@ def save(final=False, reason="manual"):
                 copy_chromium_sessions(sess)
             except Exception as e:
                 log(f"save: chrome session snapshot failed: {e!r}")
+        # Before Omarchy's window-close-all / reboot, ask Chromium to quit so
+        # each profile records a clean exit. session.json is already written
+        # and autosave is frozen — do not snapshot windows again.
+        if final:
+            try:
+                status = quit_chromium_browsers(sess, timeout=10)
+                log(f"save (final): chromium graceful quit: {status}")
+                try:
+                    copy_chromium_sessions(sess)
+                    log("save (final): re-snapshotted chromium sessions after quit")
+                except Exception as e:
+                    log(f"save (final): post-quit chrome session snapshot failed: {e!r}")
+            except Exception as e:
+                log(f"save (final): chromium graceful quit failed: {e!r}")
         log(f"save ({reason}{', final' if final else ''}): {n} windows, {msg}", echo=not QUIET and reason == "manual")
         return 0
 
@@ -3646,10 +3776,17 @@ class Restorer:
                 for wi, ci, score in pairs:
                     self.place(cands[ci]["raw"], remaining[wi])
                     progressed = True
+                    now = time.time()
+                    if g.get("first_window_at") is None:
+                        g["first_window_at"] = now
+                    g["last_group_change"] = now
                     log(f"restore: matched class={g['class']} profile={g.get('profile') or '-'} "
                         f"score={score:.2f} workspace={ws_selector(remaining[wi])} "
                         f"title={clip_title(remaining[wi].get('title'))!r}")
                 g["remaining"] = [w for wi, w in enumerate(remaining) if wi not in matched]
+                if browser and g["remaining"]:
+                    if self._claim_ntp_standin(g, cands):
+                        progressed = True
             if g["remaining"] and not done:
                 continue
             self._claim_group_leftovers(g)
@@ -3669,18 +3806,96 @@ class Restorer:
         for addr in leftover_claim_ids(g.get("profile") or "", g["class"], others, clients):
             self.claimed.add(addr)
 
+    def _claim_ntp_standin(self, g, cands):
+        """Claim a New Tab / What's New window as this profile's stand-in.
+
+        Chromium sometimes opens a first-run placeholder instead of restoring
+        the saved session for a secondary profile. Place that window on the
+        first missing saved window's workspace and use it as the Ctrl+Shift+T
+        target so Recently Closed can bring the real windows back.
+        """
+        if g.get("reopen_standin") or not g.get("remaining"):
+            return False
+        ntps = []
+        for c in cands:
+            addr = c.get("address")
+            if not addr or addr in self.claimed:
+                continue
+            raw = c.get("raw") or {}
+            title = c.get("title") or raw.get("title") or ""
+            initial = raw.get("initialTitle") or ""
+            if is_ntp_like_title(title) or is_ntp_like_title(initial):
+                ntps.append(c)
+        if not ntps:
+            return False
+        others = [
+            p for p in self.pending
+            if p is not g and p.get("class") == g.get("class") and p.get("remaining")
+            and not p.get("reopen_standin")
+        ]
+        # Ambiguous: several profiles still waiting and only as many NTP
+        # windows as waiters — wait until desperate (near deadline) unless
+        # there is a spare placeholder.
+        done_soon = time.time() + 15 >= g.get("deadline", 0)
+        if others and len(ntps) <= len(others) and not done_soon:
+            return False
+        c = ntps[0]
+        w = g["remaining"][0]
+        raw = c.get("raw") or c
+        self.claimed.add(c["address"])
+        g["reopen_standin"] = c["address"]
+        g["content_restore_failed"] = True
+        now = time.time()
+        if g.get("first_window_at") is None:
+            g["first_window_at"] = now
+        g["last_group_change"] = now
+        cls = raw.get("class") or raw.get("initialClass") or g.get("class") or "?"
+        if not self._move_to_workspace(raw, w, cls):
+            self.failed.append(cls)
+        # Track for reorder / same-PID reopen targeting, but do not count as a
+        # successfully restored saved window (content is still wrong).
+        self.placed_at[c["address"]] = w
+        # Allow Ctrl+Shift+T soon after the settle gap; Chrome already failed
+        # to restore content into this placeholder.
+        g["reopen_after"] = min(g.get("reopen_after", now + 60), now + max(2, int(g.get("min_reopen_gap", 8))))
+        log(f"restore: claimed ntp-like stand-in class={g.get('class')} "
+            f"profile={g.get('profile') or '-'} workspace={ws_selector(w)} "
+            f"title={clip_title(c.get('title') or '')!r} "
+            f"(content restore failed; will try reopen-closed-window)")
+        return True
+
     def _reopen_target(self, g):
         """Window that should receive Ctrl+Shift+T for this profile.
 
         With several Chrome profiles in one process, the process profile is
-        unknown. Pick a window whose title belongs to this profile. Sending
-        the shortcut to the other profile's window restores the wrong session.
+        unknown. Prefer an NTP/What's New stand-in we already claimed for this
+        profile, then a title match, then any live window attributed to the
+        profile (or sharing a PID with one we placed for it).
         """
         want = g.get("profile") or ""
+        cls = (g.get("class") or "").lower()
+        standin = g.get("reopen_standin") or ""
+        if standin:
+            for c in self.clients():
+                if c.get("address") == standin:
+                    return c
         titles = [w.get("title") or "" for w in (g.get("windows") or g.get("remaining") or [])]
         best, best_s = None, 0.0
+        same_pid = set()
+        for addr, saved in (self.placed_at or {}).items():
+            # Windows we placed while restoring this group's saved entries.
+            if not isinstance(saved, dict):
+                continue
+            live = self._client(addr)
+            if not live:
+                continue
+            if (live.get("class") or live.get("initialClass") or "").lower() != cls:
+                continue
+            pid = live.get("pid")
+            if pid:
+                same_pid.add(pid)
         for c in self.clients():
-            if (c.get("class") or c.get("initialClass") or "").lower() != (g.get("class") or "").lower():
+            if (c.get("class") or c.get("initialClass") or "").lower() != cls:
                 continue
             cp = self._profile_of_client(c)
             if want and cp and cp != want:
@@ -3693,10 +3908,27 @@ class Restorer:
                 best, best_s = c, max(score, best_s)
             elif not cp and score > best_s:
                 best, best_s = c, score
-        if best is None:
-            return None
-        if best_s >= 0.5 or (want and self._profile_of_client(best) == want):
+        if best is not None and (best_s >= 0.5 or (want and self._profile_of_client(best) == want)):
             return best
+        # Title similarity failed (NTP stand-in, loading title, …). Fall back
+        # to a window we know belongs to this profile, or shares the browser
+        # PID of one we already placed for it.
+        for c in self.clients():
+            if (c.get("class") or c.get("initialClass") or "").lower() != cls:
+                continue
+            cp = self._profile_of_client(c)
+            if want and cp == want:
+                return c
+            if want and cp and cp != want:
+                continue
+            if c.get("address") == standin:
+                return c
+            if same_pid and c.get("pid") in same_pid and (
+                    not want or not cp or cp == want):
+                # Only safe when this group already placed something on that PID
+                # and no other profile owns the window.
+                if is_ntp_like_title(c.get("title") or "") or c.get("address") in (self.placed_at or {}):
+                    return c
         return None
 
     def _reopen_closed_window(self, g):
@@ -3757,6 +3989,7 @@ class Restorer:
                 last_change = time.time()
                 last_addrs = addrs
                 self._extend_browser_deadlines()
+                self._note_browser_window_arrivals()
             names = tuple(sorted(
                 (c.get("address"), c.get("title") or "", (c.get("workspace") or {}).get("id"))
                 for c in self.clients()))
@@ -3774,13 +4007,64 @@ class Restorer:
                         continue
                     if not g.get("remaining"):
                         continue
+                    # Never reopen within min_reopen_gap of this profile's first
+                    # window — Chrome's own --restore-last-session is still working.
+                    first_at = g.get("first_window_at")
+                    gap = max(8, int(g.get("min_reopen_gap", settle)))
+                    if first_at is None:
+                        # No window for this profile yet; only reopen when we have
+                        # a stand-in target (NTP claim) or a title-matched window.
+                        if not g.get("reopen_standin") and not self._reopen_target(g):
+                            continue
+                    elif time.time() - first_at < gap:
+                        continue
+                    # Require this profile's own windows to have settled too.
+                    group_change = g.get("last_group_change") or first_at or 0
+                    if time.time() - group_change < settle:
+                        continue
                     opened = self._reopen_closed_window(g)
                     g["reopen_attempts"] = g.get("reopen_attempts", 0) + 1
                     if opened:
                         last_change = time.time()
                         last_addrs = {c.get("address") for c in self.clients()}
+                        g["last_group_change"] = last_change
                     break
             time.sleep(0.4)
+
+    def _note_browser_window_arrivals(self):
+        """Track when each browser group's windows first appear / change."""
+        now = time.time()
+        live = self.clients()
+        for g in self.pending:
+            if g.get("kind") != "browser":
+                continue
+            cls = (g.get("class") or "").lower()
+            prof = g.get("profile") or ""
+            addrs = []
+            for c in live:
+                if (c.get("class") or c.get("initialClass") or "").lower() != cls:
+                    continue
+                cp = self._profile_of_client(c)
+                if prof and cp and cp != prof:
+                    continue
+                # Multi-profile: process profile is unknown. Count unclaimed /
+                # stand-in / title-similar windows for this group.
+                if not cp and prof:
+                    if c.get("address") == g.get("reopen_standin"):
+                        addrs.append(c.get("address"))
+                        continue
+                    titles = [w.get("title") or "" for w in (g.get("windows") or [])]
+                    score = max((title_similarity(t, c.get("title")) for t in titles), default=0.0)
+                    if score < 0.5 and not is_ntp_like_title(c.get("title") or ""):
+                        continue
+                addrs.append(c.get("address"))
+            prev = set(g.get("seen_addrs") or [])
+            cur = set(a for a in addrs if a)
+            if cur - prev:
+                g["last_group_change"] = now
+                if g.get("first_window_at") is None:
+                    g["first_window_at"] = now
+            g["seen_addrs"] = sorted(cur)
 
     def _live_xs(self, addrs):
         out = {}
@@ -4066,16 +4350,20 @@ class Restorer:
                     wait = max(1, int(self.cfg.get("browser_wait_seconds", 150)))
                     settle = max(1, int(self.cfg.get("browser_settle_seconds", 12)))
                     now = time.time()
-                    # A restored snapshot should open every window on its own.
-                    # Give that a head start before replaying recently-closed
-                    # windows, so a slow cold start is not duplicated.
-                    reopen_after = now + (max(settle * 3, min(45, wait // 2)) if snapshot else settle)
+                    # --restore-last-session (and Chrome's crash restore) open
+                    # windows on their own. Give that a head start before
+                    # Ctrl+Shift+T, whether or not we installed a sidecar —
+                    # reopening too early duplicates tabs/windows.
+                    reopen_after = now + max(settle * 3, min(45, wait // 2))
                     self.pending.append({
                         "class": cls, "kind": "browser", "profile": prof,
                         "windows": list(wins), "remaining": list(wins), "snapshot": snapshot,
                         "deadline": now + wait, "deadline_cap": now + wait + wait // 2,
                         "reopen_after": reopen_after, "reopen_attempts": 0,
                         "reopen_budget": len(wins), "reopen_stop": False,
+                        "min_reopen_gap": max(8, settle),
+                        "first_window_at": None, "last_group_change": None,
+                        "seen_addrs": [], "reopen_standin": None,
                     })
                     continue
                 if k in ("app", "webapp"):
