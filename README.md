@@ -14,7 +14,7 @@ quietly and restores once on the next login.
 | | |
 |---|---|
 | **Plugin id** | `eric.session-restore` |
-| **Version** | 1.3.5 |
+| **Version** | 1.3.6 |
 | **License** | MIT |
 | **Author** | Eric Westphal &lt;BonanzaEric@gmail.com&gt; |
 | **Based on** | [wbarakat/omarchy-session-restore](https://github.com/wbarakat/omarchy-session-restore) (MIT, © 2026 Waleed) |
@@ -501,6 +501,20 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
   via `uwsm stop` / a keybinding instead of the menu skips the final snapshot.
 
 ---
+
+## Recent changes
+
+### 1.3.6
+- On **Logout / Reboot / Shutdown** (`save --final`), Chromium-family browsers
+  are asked to quit cleanly before Omarchy closes windows, so profiles record
+  a normal exit and the pre-logout session snapshot can be installed on the
+  next login instead of Chrome's crash-restore bubble.
+- Ctrl+Shift+T reopen waits longer while `--restore-last-session` is still
+  opening windows, and never fires within a few seconds of a profile's first
+  window — avoiding duplicate tabs/windows after a crashy exit.
+- A New Tab / What's New placeholder for a profile with unmatched saved
+  windows is claimed as that profile's stand-in, moved to the saved
+  workspace, and used as the reopen target when title matching would fail.
 
 ## Attribution & license
 

@@ -382,5 +382,58 @@ class MidUpgradeChromeTests(unittest.TestCase):
         self.assertFalse(m.would_collapse_chrome_profiles(old, old))
         self.assertFalse(m.would_collapse_chrome_profiles(collapsed, old))
 
+
+
+class NtpStandinTests(unittest.TestCase):
+    def test_whats_new_and_new_tab_are_placeholders(self):
+        self.assertTrue(m.is_ntp_like_title("What's New - Google Chrome"))
+        self.assertTrue(m.is_ntp_like_title("New Tab - Google Chrome"))
+        self.assertTrue(m.is_ntp_like_title("Google Chrome"))
+        self.assertTrue(m.is_ntp_like_title(""))
+
+    def test_real_mail_titles_are_not_placeholders(self):
+        self.assertFalse(m.is_ntp_like_title(GMAIL))
+        self.assertFalse(m.is_ntp_like_title(DORMOUSE))
+        self.assertFalse(m.is_ntp_like_title(GMAIL_SHORT))
+        self.assertFalse(m.is_ntp_like_title(MONITOR))
+
+
+class ChromiumQuitHelpersTests(unittest.TestCase):
+    def test_sess_chromium_profiles_dedupes(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        ud = os.path.join(tmp, "google-chrome")
+        os.makedirs(ud)
+        argv = ["/usr/bin/google-chrome-stable", f"--user-data-dir={ud}",
+                "--profile-directory=Default"]
+        sess = {"items": [
+            {"kind": "browser", "profile": "Default", "argv": argv},
+            {"kind": "browser", "profile": "Default", "argv": argv},
+            {"kind": "browser", "profile": "Profile 1",
+             "argv": ["/usr/bin/google-chrome-stable", f"--user-data-dir={ud}",
+                      "--profile-directory=Profile 1"]},
+            {"kind": "app", "profile": "", "argv": ["obsidian"]},
+        ]}
+        got = m.sess_chromium_profiles(sess)
+        profiles = sorted(p for _ud, p in got)
+        self.assertEqual(profiles, ["Default", "Profile 1"])
+
+    def test_exit_kind_normal_vs_crashed(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        ud = os.path.join(tmp, "google-chrome")
+        prof = "Default"
+        os.makedirs(os.path.join(ud, prof))
+        with open(os.path.join(ud, prof, "Preferences"), "w") as f:
+            json.dump({"profile": {"exit_type": "Normal", "exited_cleanly": True}}, f)
+        self.assertEqual(m.chromium_exit_kind(ud, prof), "normal")
+        with open(os.path.join(ud, prof, "Preferences"), "w") as f:
+            json.dump({"profile": {"exit_type": "Crashed"}}, f)
+        self.assertEqual(m.chromium_exit_kind(ud, prof), "crashed")
+        with open(os.path.join(ud, prof, "Preferences"), "w") as f:
+            json.dump({"profile": {"exit_type": "SessionEnded"}}, f)
+        self.assertEqual(m.chromium_exit_kind(ud, prof), "ended")
+
+
 if __name__ == "__main__":
     unittest.main()
