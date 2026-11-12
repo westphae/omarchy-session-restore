@@ -525,3 +525,71 @@ class ChromiumQuitHelpersTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SecondProfilePlaceholderTests(unittest.TestCase):
+    """Two profiles launched together: the forwarded one opens a New Tab."""
+
+    def test_new_tab_is_not_matched_by_its_initial_title(self):
+        saved = [{"class": "google-chrome", "profile": "Default", "title": WORKMAIL,
+                  "initial_title": "New Tab - Google Chrome", "xdg_tag": "",
+                  "workspace": 2}]
+        live = [{"class": "google-chrome", "profile": "", "title": "New Tab - Google Chrome",
+                 "initialTitle": "New Tab - Google Chrome", "xdgTag": ""}]
+        self.assertEqual(m.match_windows_by_name(saved, live), [])
+
+    def test_loading_title_still_matches_as_only_candidate(self):
+        saved = [{"class": "google-chrome", "profile": "Default", "title": GMAIL,
+                  "initial_title": "New Tab - Google Chrome", "xdg_tag": "", "workspace": 5}]
+        live = [{"class": "google-chrome", "profile": "", "title": GMAIL_SHORT,
+                 "initialTitle": "New Tab - Google Chrome", "xdgTag": ""}]
+        self.assertEqual(len(m.match_windows_by_name(saved, live)), 1)
+
+    def test_profile_with_most_windows_launches_first(self):
+        sess = {"items": [
+            {"kind": "browser", "class": "google-chrome", "profile": "Default",
+             "windows": [{"workspace": 2}]},
+            {"kind": "browser", "class": "google-chrome", "profile": "Profile 1",
+             "windows": [{"workspace": 5}, {"workspace": 6}]},
+        ]}
+        self.assertEqual([i["profile"] for i in m.ordered_items(sess)], ["Profile 1", "Default"])
+
+    def _restorer(self, clients):
+        r = m.Restorer.__new__(m.Restorer)
+        r.cfg = {}
+        r.claimed = set()
+        r.placed_at = {}
+        r.sess = {"items": [
+            {"kind": "browser", "class": "google-chrome", "profile": "Default", "windows": []},
+            {"kind": "browser", "class": "google-chrome", "profile": "Profile 1", "windows": []},
+        ]}
+        r._prof_cache = {}
+        r.clients = lambda _c=clients: list(_c)
+        r._client = lambda addr, _c=clients: next((c for c in _c if c["address"] == addr), None)
+        r._process_profile = lambda c: "Profile 1"
+        return r
+
+    def test_reopen_never_targets_another_profiles_window(self):
+        other = {"address": "0xother", "class": "google-chrome", "pid": 7, "title": GMAIL}
+        ntp = {"address": "0xntp", "class": "google-chrome", "pid": 7,
+               "title": "New Tab - Google Chrome"}
+        r = self._restorer([other, ntp])
+        other_saved = {"title": GMAIL, "workspace": 5, "stable": 1}
+        mine = {"title": WORKMAIL, "workspace": 2, "stable": 2}
+        r.placed_at["0xother"] = other_saved
+        g = {"class": "google-chrome", "profile": "Default", "windows": [mine],
+             "remaining": [mine], "reopen_standin": None}
+        target = r._reopen_target(g)
+        self.assertNotEqual((target or {}).get("address"), "0xother")
+
+    def test_reopen_uses_own_standin(self):
+        other = {"address": "0xother", "class": "google-chrome", "pid": 7, "title": GMAIL}
+        ntp = {"address": "0xntp", "class": "google-chrome", "pid": 7,
+               "title": "New Tab - Google Chrome"}
+        r = self._restorer([other, ntp])
+        mine = {"title": WORKMAIL, "workspace": 2, "stable": 2}
+        r.placed_at["0xother"] = {"title": GMAIL, "workspace": 5, "stable": 1}
+        r.placed_at["0xntp"] = mine
+        g = {"class": "google-chrome", "profile": "Default", "windows": [mine],
+             "remaining": [mine], "reopen_standin": "0xntp"}
+        self.assertEqual(r._reopen_target(g)["address"], "0xntp")

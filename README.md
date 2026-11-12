@@ -14,7 +14,7 @@ quietly and restores once on the next login.
 | | |
 |---|---|
 | **Plugin id** | `eric.session-restore` |
-| **Version** | 1.3.7 |
+| **Version** | 1.3.8 |
 | **License** | MIT |
 | **Author** | Eric Westphal ([@westphae](https://github.com/westphae)) |
 | **Based on** | [wbarakat/omarchy-session-restore](https://github.com/wbarakat/omarchy-session-restore) (MIT, © 2026 Waleed) |
@@ -445,6 +445,7 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
   "save_interval_seconds": 60,
   "browser_wait_seconds": 150,
   "browser_settle_seconds": 12,
+  "browser_primary_wait_seconds": 15,
   "restore_chromium_session": true,
   "skip_classes": ["org.pulseaudio.pavucontrol"],
   "resume_commands": ["herdr", "tmux", "zellij", "nvim", "btop", "lazygit", "yazi"],
@@ -464,6 +465,7 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
 | `save_interval_seconds` | `60` | Periodic autosave interval |
 | `browser_wait_seconds` | `150` | Cap on how long to wait for browser windows. Restore returns as soon as every saved window has matched. While new windows are still appearing the cap can stretch by half again |
 | `browser_settle_seconds` | `12` | Quiet period with no new windows before reopening a missing Chrome window |
+| `browser_primary_wait_seconds` | `15` | When several profiles of one Chromium browser are restored, wait up to this long for the first profile's browser process before launching the others |
 | `restore_chromium_session` | `true` | After a clean Chrome exit, restore the pre-logout session snapshot so every window comes back |
 | `skip_classes` | `[]` | Window classes never saved (full-match regexes) |
 | `resume_commands` | *(built-in TUI list)* | Foreground programs to relaunch in terminals |
@@ -503,6 +505,20 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
 ---
 
 ## Recent changes
+
+### 1.3.8
+- Several profiles of one Chromium browser are no longer launched at the
+  same instant. Only the profile that starts the browser process gets
+  `--restore-last-session`; the others are handed to the running process and
+  open a New Tab. The profile with the most saved windows now starts first,
+  and the rest launch once its process is up, so which profile restores
+  natively is no longer a race.
+- A New Tab / What's New placeholder is no longer treated as a saved window
+  just because every Chromium window starts out titled "New Tab". It stays
+  free to become that profile's stand-in.
+- Ctrl+Shift+T never targets a window placed for another profile. Profiles
+  share one browser PID, so the same-PID fallback could reopen a closed tab
+  in the wrong profile's window.
 
 ### 1.3.7
 - After saved windows have been reopened, a leftover New Tab / What's New

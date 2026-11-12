@@ -43,7 +43,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "1.3.7"
+VERSION = "1.3.8"
 FORMAT = 1
 HOME = os.path.expanduser("~")
 XDG_STATE = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state")
@@ -78,6 +78,7 @@ DEFAULTS = {
     "event_debounce_seconds": 3,
     "browser_wait_seconds": 150,  # cap while waiting for late browser windows
     "browser_settle_seconds": 12,  # quiet period before reopening closed browser windows
+    "browser_primary_wait_seconds": 15,  # wait for the first Chromium process before launching other profiles
     "restore_chromium_session": True,  # after a clean exit, put back the pre-logout Chrome session
     "terminal_wait_seconds": 10,
     "app_wait_seconds": 20,
@@ -2227,6 +2228,25 @@ def chromium_profile_is_running(user_data, profile):
     return False
 
 
+def chromium_user_data_running(user_data):
+    """True when any Chromium browser main process uses this user-data dir."""
+    try:
+        want = os.path.realpath(user_data)
+    except OSError:
+        return False
+    for pid in chromium_browser_main_pids():
+        argv = cmdline(str(pid))
+        if not argv:
+            continue
+        ud = chromium_user_data(base(argv[0]), "", argv)
+        try:
+            if ud and os.path.realpath(ud) == want:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def with_restore_last_session(argv):
     """Ask Chromium to restore its session even if the startup pref would not."""
     if any(a == "--restore-last-session" or a.startswith("--restore-last-session=") for a in argv):
@@ -2264,6 +2284,11 @@ def window_name_score(saved, live):
     if distinctive_name(live_initial):
         scores.append(title_similarity(saved.get("title"), live_initial))
     return max(scores) if scores else 0.0
+
+
+def placeholder_for(saved_title, live_title):
+    """True when a live New Tab-like window stands in for a saved real page."""
+    return is_ntp_like_title(live_title) and not is_ntp_like_title(saved_title)
 
 
 def match_windows_by_name(saved, clients, threshold=_TITLE_ACCEPT):
@@ -2312,8 +2337,14 @@ def match_windows_by_name(saved, clients, threshold=_TITLE_ACCEPT):
         si, ci = sis[0], cis[0]
         if ci in used_c or si in used_s:
             continue
+        # A New Tab / What's New placeholder is not the saved window, even
+        # though every Chromium window starts life titled "New Tab".
+        if placeholder_for(saved[si].get("title"), clients[ci].get("title")):
+            continue
+        initial = saved[si].get("initial_title") or ""
         if not (only_candidate_match(saved[si].get("title"), clients[ci].get("title"))
-                or only_candidate_match(saved[si].get("initial_title") or "", clients[ci].get("initialTitle") or clients[ci].get("title") or "")):
+                or (not is_ntp_like_title(initial) and only_candidate_match(
+                    initial, clients[ci].get("initialTitle") or clients[ci].get("title") or ""))):
             continue
         used_s.add(si)
         used_c.add(ci)
@@ -3383,7 +3414,12 @@ def ordered_items(sess):
         w = it["windows"][0]
         at = w.get("at") or [0, 0]
         return (w.get("workspace") or 0, at[0], at[1])
-    br = [i for i in items if i["kind"] == "browser"]
+    # Profiles of one Chromium user-data dir share a process. Only the profile
+    # that starts it gets --restore-last-session; later ones are handed to the
+    # running process and open a New Tab. Start with the profile that has the
+    # most windows, so the fewest have to come back by Ctrl+Shift+T.
+    br = sorted([i for i in items if i["kind"] == "browser"],
+                key=lambda i: -len(i.get("windows") or []))
     mid = sorted([i for i in items if i["kind"] in ("terminal", "app")], key=pos)
     web = sorted([i for i in items if i["kind"] == "webapp"], key=pos)
     return br + mid + web
@@ -3918,7 +3954,9 @@ class Restorer:
         same_pid = set()
         for addr, saved in (self.placed_at or {}).items():
             # Windows we placed while restoring this group's saved entries.
-            if not isinstance(saved, dict):
+            # Profiles of one browser share a PID, so another group's window
+            # must not count here.
+            if not isinstance(saved, dict) or not self._placed_for_group(g, addr):
                 continue
             live = self._client(addr)
             if not live:
@@ -3933,6 +3971,8 @@ class Restorer:
                 continue
             cp = self._profile_of_client(c)
             if want and cp and cp != want:
+                continue
+            if c.get("address") in (self.placed_at or {}) and not self._placed_for_group(g, c.get("address")):
                 continue
             score = 0.0
             for title in titles:
@@ -3951,6 +3991,8 @@ class Restorer:
             if (c.get("class") or c.get("initialClass") or "").lower() != cls:
                 continue
             cp = self._profile_of_client(c)
+            if c.get("address") in (self.placed_at or {}) and not self._placed_for_group(g, c.get("address")):
+                continue
             if want and cp == want:
                 return c
             if want and cp and cp != want:
@@ -3998,6 +4040,33 @@ class Restorer:
         log(f"restore: reopen produced no new {g.get('class')} window for profile {g.get('profile') or '-'}; stopping")
         g["reopen_stop"] = True
         return False
+
+    def _wait_chromium_started(self, ud, prof):
+        """Let the first profile own the new browser process.
+
+        Launching two profiles at once races for Chromium's singleton; the
+        loser is forwarded, skips --restore-last-session and opens a New Tab.
+        """
+        limit = max(0, int(self.cfg.get("browser_primary_wait_seconds", 15)))
+        end = time.time() + limit
+        while time.time() < end:
+            if chromium_user_data_running(ud):
+                log(f"restore: chromium started for profile {prof or '-'}; launching other profiles next")
+                return True
+            time.sleep(0.2)
+        log(f"restore: chromium for profile {prof or '-'} not running after {limit}s; continuing")
+        return False
+
+    def _placed_for_group(self, g, addr):
+        """True when the window at addr was placed for one of g's saved windows."""
+        saved = (self.placed_at or {}).get(addr)
+        if not isinstance(saved, dict):
+            return False
+        if addr == g.get("reopen_standin"):
+            return True
+        key = (saved.get("stable"), saved.get("title"), saved.get("workspace"))
+        return any((w.get("stable"), w.get("title"), w.get("workspace")) == key
+                   for w in (g.get("windows") or []))
 
     def _extend_browser_deadlines(self):
         """Keep waiting while Chrome is still creating windows, up to the cap."""
@@ -4374,6 +4443,7 @@ class Restorer:
                                 enabled=self.cfg.get("restore_chromium_session", True))
                             log(f"restore: chrome profile {prof} session snapshot: {why}")
                         argv = with_restore_last_session(argv)
+                        starting = bool(ud) and not chromium_user_data_running(ud)
                         if not self.launch(argv, primary_ws(it)):
                             self.failed.append(cls)
                             if not existing:
@@ -4381,6 +4451,8 @@ class Restorer:
                             snapshot = False
                             log(f"restore: {cls} profile={prof or '-'} did not launch; "
                                 "placing windows that are already open")
+                        elif starting:
+                            self._wait_chromium_started(ud, prof)
                     wait = max(1, int(self.cfg.get("browser_wait_seconds", 150)))
                     settle = max(1, int(self.cfg.get("browser_settle_seconds", 12)))
                     now = time.time()
