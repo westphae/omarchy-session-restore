@@ -14,7 +14,7 @@ quietly and restores once on the next login.
 | | |
 |---|---|
 | **Plugin id** | `eric.session-restore` |
-| **Version** | 1.3.6 |
+| **Version** | 1.3.7 |
 | **License** | MIT |
 | **Author** | Eric Westphal ([@westphae](https://github.com/westphae)) |
 | **Based on** | [wbarakat/omarchy-session-restore](https://github.com/wbarakat/omarchy-session-restore) (MIT, © 2026 Waleed) |
@@ -503,6 +503,12 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
 ---
 
 ## Recent changes
+
+### 1.3.7
+- After saved windows have been reopened, a leftover New Tab / What's New
+  stand-in is closed. If that placeholder's title has changed to real
+  content, it is left alone. The stand-in is not counted as a restored
+  window.
 
 ### 1.3.6
 - On **Logout / Reboot / Shutdown** (`save --final`), Chromium-family browsers

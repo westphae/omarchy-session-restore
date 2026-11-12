@@ -397,6 +397,94 @@ class NtpStandinTests(unittest.TestCase):
         self.assertFalse(m.is_ntp_like_title(GMAIL_SHORT))
         self.assertFalse(m.is_ntp_like_title(MONITOR))
 
+    def test_claim_log_does_not_say_content_restore_failed(self):
+        with open(_BIN, encoding="utf-8") as f:
+            src = f.read()
+        start = src.index("def _claim_ntp_standin")
+        end = src.index("def _close_ntp_standin")
+        body = src[start:end]
+        self.assertIn("placeholder; will use it as the reopen-closed-window target", body)
+        self.assertNotIn("content restore failed", body)
+
+
+class NtpStandinCloseTests(unittest.TestCase):
+    def _restorer(self, clients):
+        r = m.Restorer.__new__(m.Restorer)
+        r.cfg = {}
+        r.claimed = set()
+        r.placed = 0
+        r.failed = []
+        r.pending = []
+        r.placed_at = {}
+        live = {c["address"]: c for c in clients}
+        r._client = lambda addr, _live=live: _live.get(addr)
+        return r
+
+    def _patch_dispatch(self):
+        calls = []
+        orig = m.dispatch
+        m.dispatch = lambda lua, _c=calls: (_c.append(lua) or True)
+        self.addCleanup(lambda: setattr(m, "dispatch", orig))
+        return calls
+
+    def test_closes_ntp_standin_once_remaining_is_empty(self):
+        addr = "0xstandin"
+        r = self._restorer([{"address": addr, "title": "New Tab - Google Chrome"}])
+        r.placed_at[addr] = {"title": MONITOR, "workspace": 1}
+        r.claimed.add(addr)
+        calls = self._patch_dispatch()
+        g = {"remaining": [], "reopen_standin": addr,
+             "class": "google-chrome", "profile": "Default"}
+        self.assertTrue(r._close_ntp_standin(g))
+        self.assertEqual(calls, [f"closewindow address:{addr}"])
+        self.assertIsNone(g["reopen_standin"])
+        self.assertNotIn(addr, r.placed_at)
+        self.assertNotIn(addr, r.claimed)
+        self.assertEqual(r.placed, 0)
+
+    def test_leaves_standin_if_title_became_real_content(self):
+        addr = "0xstandin"
+        r = self._restorer([{"address": addr, "title": WORKMAIL}])
+        r.placed_at[addr] = {"title": WORKMAIL, "workspace": 1}
+        r.claimed.add(addr)
+        calls = self._patch_dispatch()
+        g = {"remaining": [], "reopen_standin": addr,
+             "class": "google-chrome", "profile": "Default"}
+        self.assertFalse(r._close_ntp_standin(g))
+        self.assertEqual(calls, [])
+        self.assertEqual(g["reopen_standin"], addr)
+        self.assertIn(addr, r.placed_at)
+        self.assertIn(addr, r.claimed)
+        self.assertEqual(r.placed, 0)
+
+    def test_leaves_standin_while_saved_windows_are_still_missing(self):
+        addr = "0xstandin"
+        r = self._restorer([{"address": addr, "title": "New Tab - Google Chrome"}])
+        r.placed_at[addr] = {"title": MONITOR, "workspace": 1}
+        r.claimed.add(addr)
+        calls = self._patch_dispatch()
+        g = {"remaining": [{"title": MONITOR}], "reopen_standin": addr,
+             "class": "google-chrome", "profile": "Default"}
+        self.assertFalse(r._close_ntp_standin(g))
+        self.assertEqual(calls, [])
+        self.assertEqual(g["reopen_standin"], addr)
+        self.assertIn(addr, r.placed_at)
+
+    def test_gone_standin_is_dropped_without_dispatch(self):
+        addr = "0xstandin"
+        r = self._restorer([])
+        r.placed_at[addr] = {"title": MONITOR, "workspace": 1}
+        r.claimed.add(addr)
+        calls = self._patch_dispatch()
+        g = {"remaining": [], "reopen_standin": addr,
+             "class": "google-chrome", "profile": "Default"}
+        self.assertFalse(r._close_ntp_standin(g))
+        self.assertEqual(calls, [])
+        self.assertIsNone(g["reopen_standin"])
+        self.assertNotIn(addr, r.placed_at)
+        self.assertNotIn(addr, r.claimed)
+        self.assertEqual(r.placed, 0)
+
 
 class ChromiumQuitHelpersTests(unittest.TestCase):
     def test_sess_chromium_profiles_dedupes(self):

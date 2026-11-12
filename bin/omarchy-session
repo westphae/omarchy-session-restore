@@ -43,7 +43,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "1.3.6"
+VERSION = "1.3.7"
 FORMAT = 1
 HOME = os.path.expanduser("~")
 XDG_STATE = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state")
@@ -3790,6 +3790,8 @@ class Restorer:
             if g["remaining"] and not done:
                 continue
             self._claim_group_leftovers(g)
+            if not g["remaining"]:
+                self._close_ntp_standin(g)
             if g["remaining"]:
                 summary = note_unmatched_windows(
                     self.failed, g["class"], g["remaining"], g.get("last_notes"), g.get("profile") or "")
@@ -3861,8 +3863,40 @@ class Restorer:
         log(f"restore: claimed ntp-like stand-in class={g.get('class')} "
             f"profile={g.get('profile') or '-'} workspace={ws_selector(w)} "
             f"title={clip_title(c.get('title') or '')!r} "
-            f"(content restore failed; will try reopen-closed-window)")
+            f"(placeholder; will use it as the reopen-closed-window target)")
         return True
+
+    def _close_ntp_standin(self, g):
+        """Close a leftover New Tab / What's New stand-in once saved windows are back.
+
+        Used only when this profile has no unmatched saved windows left. If the
+        stand-in's current title has changed to real content, leave it alone.
+        The stand-in is tracked in placed_at for reopen targeting, but is not
+        a successfully restored saved window: drop it from placed_at and do
+        not increment self.placed.
+        """
+        if g.get("remaining"):
+            return False
+        addr = g.get("reopen_standin") or ""
+        if not addr:
+            return False
+        live = self._client(addr)
+        title = (live or {}).get("title") or ""
+        if live and not is_ntp_like_title(title):
+            log(f"restore: leaving ntp-like stand-in class={g.get('class')} "
+                f"profile={g.get('profile') or '-'} "
+                f"title={clip_title(title)!r} (now has content)")
+            return False
+        if live:
+            ok = dispatch(f"closewindow address:{addr}")
+            log(f"restore: closed ntp-like stand-in class={g.get('class')} "
+                f"profile={g.get('profile') or '-'} "
+                f"title={clip_title(title)!r}"
+                f"{'' if ok else ' (dispatch failed)'}")
+        self.placed_at.pop(addr, None)
+        self.claimed.discard(addr)
+        g["reopen_standin"] = None
+        return bool(live)
 
     def _reopen_target(self, g):
         """Window that should receive Ctrl+Shift+T for this profile.
