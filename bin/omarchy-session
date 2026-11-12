@@ -43,7 +43,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "1.3.8"
+VERSION = "1.3.9"
 FORMAT = 1
 HOME = os.path.expanduser("~")
 XDG_STATE = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state")
@@ -3924,7 +3924,7 @@ class Restorer:
                 f"title={clip_title(title)!r} (now has content)")
             return False
         if live:
-            ok = dispatch(f"closewindow address:{addr}")
+            ok = dispatch(f"hl.dsp.window.close({{ window = {lua_long('address:' + addr)} }})")
             log(f"restore: closed ntp-like stand-in class={g.get('class')} "
                 f"profile={g.get('profile') or '-'} "
                 f"title={clip_title(title)!r}"

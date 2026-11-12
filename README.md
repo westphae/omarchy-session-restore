@@ -14,7 +14,7 @@ quietly and restores once on the next login.
 | | |
 |---|---|
 | **Plugin id** | `eric.session-restore` |
-| **Version** | 1.3.8 |
+| **Version** | 1.3.9 |
 | **License** | MIT |
 | **Author** | Eric Westphal ([@westphae](https://github.com/westphae)) |
 | **Based on** | [wbarakat/omarchy-session-restore](https://github.com/wbarakat/omarchy-session-restore) (MIT, © 2026 Waleed) |
@@ -505,6 +505,11 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
 ---
 
 ## Recent changes
+
+### 1.3.9
+- The leftover New Tab stand-in is actually closed now. 1.3.7 sent
+  Hyprland's old `closewindow address:…` dispatcher, which the Lua dispatcher
+  rejects, so an empty New Tab window stayed open next to the restored one.
 
 ### 1.3.8
 - Several profiles of one Chromium browser are no longer launched at the

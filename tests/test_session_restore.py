@@ -436,7 +436,7 @@ class NtpStandinCloseTests(unittest.TestCase):
         g = {"remaining": [], "reopen_standin": addr,
              "class": "google-chrome", "profile": "Default"}
         self.assertTrue(r._close_ntp_standin(g))
-        self.assertEqual(calls, [f"closewindow address:{addr}"])
+        self.assertEqual(calls, [f"hl.dsp.window.close({{ window = [[address:{addr}]] }})"])
         self.assertIsNone(g["reopen_standin"])
         self.assertNotIn(addr, r.placed_at)
         self.assertNotIn(addr, r.claimed)
@@ -593,3 +593,16 @@ class SecondProfilePlaceholderTests(unittest.TestCase):
         g = {"class": "google-chrome", "profile": "Default", "windows": [mine],
              "remaining": [mine], "reopen_standin": "0xntp"}
         self.assertEqual(r._reopen_target(g)["address"], "0xntp")
+
+
+class DispatchSyntaxTests(unittest.TestCase):
+    """Hyprland's Lua dispatcher rejects the old 'closewindow address:…' form."""
+
+    def test_every_literal_dispatch_is_lua(self):
+        import re
+        with open(_BIN, encoding="utf-8") as f:
+            src = f.read()
+        calls = re.findall(r'dispatch\(\s*f?"([^"]*)', src)
+        self.assertTrue(calls)
+        for c in calls:
+            self.assertTrue(c.startswith("hl.dsp."), c)
