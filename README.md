@@ -14,7 +14,7 @@ quietly and restores once on the next login.
 | | |
 |---|---|
 | **Plugin id** | `eric.session-restore` |
-| **Version** | 1.3.9 |
+| **Version** | 1.4.0 |
 | **License** | MIT |
 | **Author** | Eric Westphal ([@westphae](https://github.com/westphae)) |
 | **Based on** | [wbarakat/omarchy-session-restore](https://github.com/wbarakat/omarchy-session-restore) (MIT, © 2026 Waleed) |
@@ -206,17 +206,29 @@ pre-logout save, the plugin keeps a private copy of that profile's Chrome
 session files and puts that copy back before launch. A crash is left alone —
 Chrome's own file still has the full session.
 
-Several Chrome profiles share one browser process. The process's
-`--profile-directory` only names the profile that was launched first, and
-Chrome sometimes rewrites that argument as an unquoted `Profile 1`. With more
-than one saved profile, windows are matched by title instead of by that flag.
+Several Chrome profiles share one browser process, so neither the process
+nor the window title says which profile a window belongs to. Each profile's
+own session file does (`<profile>/Sessions/Session_*`, Chromium's "SNSS"
+format). The plugin reads those files directly: every open window of every
+profile, with its tabs in order and its selected tab. A Hyprland window is
+tied to a Chromium window by its live title, which is always the selected
+tab's title (unread counts ignored; windows that show the same title pair up
+in the order they were opened). From that the save records each window's
+profile and its list of tabs.
 A terminal whose class is not the emulator's own (Omarchy's floating terminal
 is `org.omarchy.terminal` on top of ghostty) is relaunched with `--class=`
 so the new window is the one restore is waiting for.
 
-Windows are matched to workspaces by title. Unread counts and a shortened
-tab title (`JLCPCB`, `Gmail`) still match, and each profile only takes its
-own windows. If something is still missing after new windows stop appearing,
+On restore each profile is launched with `--profile-directory=…` (never
+without one, which would open Chrome's profile picker). Once Chrome has
+reopened its windows, the plugin reads the session files again and pairs
+each saved window with the open window of the same profile that has the most
+tabs in common (URLs, ignoring `#fragments` and New Tab pages; at least half
+of the smaller window's tabs must match). Switching tabs, or a title that
+changed since the last save, does not matter. Sessions saved before 1.4 have
+no tab lists and are still matched by title. Chrome's profile picker is never
+mistaken for a restored window; if one appears during restore it is closed.
+If something is still missing after new windows stop appearing,
 the plugin sends Chrome's reopen-closed-window shortcut (the same action as
 History → recently closed), once per missing window.
 
@@ -488,7 +500,10 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
 * **First time on a new dock / display** — no saved layout yet; arrange once,
   then autosave remembers it for next time.
 * **Browsers** need their own session restore (Chrome: *Continue where you
-  left off*). Titles are used to match windows to workspaces. After a clean
+  left off*). Chromium-family windows are matched by their tabs, read from
+  the browser's session files; Firefox-family windows by title. An encrypted
+  Chromium session file cannot be read; those windows fall back to the
+  last-used profile and title matching. After a clean
   exit the plugin restores Chrome's pre-logout session so windows the logout
   close dropped are not lost; turn that off with `restore_chromium_session`.
 * **Terminal scrollback** and arbitrary running processes are not preserved —
@@ -505,6 +520,25 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
 ---
 
 ## Recent changes
+
+### 1.4.0
+- Chrome windows are identified by their set of tabs, not by their title.
+  The plugin now parses each profile's Chromium session file (SNSS) to get
+  every open window with its tabs, and uses that to tell which profile a
+  window belongs to. The old way grepped title-like strings out of those
+  files and scored them, so a short title such as a three-letter site name
+  could not be placed in a profile; that window was then saved without one,
+  and restoring it opened Chrome's profile picker.
+- `session.json` format 2: each saved Chrome window has an id (`w1`, `w2`,
+  …), its profile, and its tab URLs and titles. Restore pairs windows by tab
+  overlap within a profile. Format 1 files still load and match by title.
+- A Chromium window is never saved or launched without a profile. A window
+  that is not in any session file yet keeps what the previous save found, or
+  goes to Local State's last-used profile.
+- The profile picker is never claimed as a New Tab stand-in, and is closed
+  if it appears during restore. A stand-in must belong to the right profile.
+- `restore --dry-run` shows, for each saved Chrome window, how many tabs it
+  has and which open window it would pair with now.
 
 ### 1.3.9
 - The leftover New Tab stand-in is actually closed now. 1.3.7 sent

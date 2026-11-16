@@ -38,13 +38,16 @@ import shlex
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 
-VERSION = "1.3.9"
-FORMAT = 1
+VERSION = "1.4.0"
+# 2: Chromium windows carry their profile and tab list ("chrome"). 1 still loads.
+FORMAT = 2
+READ_FORMATS = (1, 2)
 HOME = os.path.expanduser("~")
 XDG_STATE = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state")
 XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
@@ -1694,13 +1697,6 @@ def terminal_launch(term_key, spec, base_argv, cwd, resume, default_ids, desk_en
     return argv
 
 
-def norm_title(t):
-    t = re.sub(r"^\(\d[\d,]*\)\s*", "", t or "")
-    t = re.sub(r"\s+[-—–]\s+(Google Chrome|Chromium|Brave|Microsoft\s*Edge|Vivaldi|"
-               r"Mozilla Firefox|Firefox|LibreWolf|Zen Browser|Helium)$", "", t)
-    return t.strip().lower()
-
-
 # Browser window titles move while Chrome is restoring: unread counts change,
 # and a window often shows only the site name ("Gmail", "JLCPCB") before the
 # full tab title arrives. Matching uses this key instead of the raw title.
@@ -1945,6 +1941,487 @@ def newest_snss(directory, prefix):
         return None
     found.sort()
     return found[-1][1]
+
+
+# ------------------------------------------------ Chromium session files --
+# Chromium keeps each profile's open windows in Sessions/Session_<stamp>, an
+# "SNSS" file: the magic, an int32 version, then commands written as
+# <uint16 size><uint8 id><payload>. Replaying the commands gives the windows
+# that are open now, each with its tabs in order and its selected tab. That
+# is the only place that knows which profile a window belongs to and which
+# tabs it holds; the window title only shows the selected tab.
+_SNSS_SET_TAB_WINDOW = 0
+_SNSS_SET_TAB_INDEX = 2
+_SNSS_PRUNED_FROM_BACK = 5
+_SNSS_UPDATE_NAVIGATION = 6
+_SNSS_SET_SELECTED_NAVIGATION = 7
+_SNSS_SET_SELECTED_TAB = 8
+_SNSS_SET_WINDOW_TYPE = 9
+_SNSS_PRUNED_FROM_FRONT = 11
+_SNSS_SET_PINNED = 12
+_SNSS_SET_WINDOW_BOUNDS = 14
+_SNSS_SET_WINDOW_APP_NAME = 15
+_SNSS_TAB_CLOSED = 16
+_SNSS_WINDOW_CLOSED = 17
+_SNSS_SET_ACTIVE_WINDOW = 20
+_SNSS_PRUNED = 24
+_SNSS_SET_WINDOW_USER_TITLE = 31
+# Versions 1 and 3 are plain; 2 and 4 are encrypted and cannot be read.
+_SNSS_PLAIN_VERSIONS = (1, 3)
+# Chromium's window types. Normal and popup windows carry the browser class;
+# app windows are web apps with a class of their own.
+CHROME_WINDOW_NORMAL, CHROME_WINDOW_POPUP = 0, 1
+_CHROME_BROWSER_WINDOW_TYPES = (CHROME_WINDOW_NORMAL, CHROME_WINDOW_POPUP)
+_CHROME_MAX_TABS = 500
+_CHROME_MAX_URL = 2048
+_CHROME_MAX_TITLE = 300
+# Pages that say nothing about which window this is.
+_BLANK_URL_RE = re.compile(r"^(?:about:blank|(?:chrome|chrome-untrusted|brave|edge|vivaldi)://"
+                           r"(?:newtab|new-tab-page|whats-new|welcome)[/?#]?.*)$", re.I)
+_BARE_BROWSER_TITLES = frozenset({"google chrome", "chrome", "chromium", "brave",
+                                  "microsoft edge", "vivaldi", "helium"})
+
+
+class SnssError(ValueError):
+    """A session file that cannot be read at all."""
+
+
+class _SnssReader:
+    """Bounds-checked reader for one command payload (base::Pickle layout)."""
+
+    def __init__(self, data):
+        self.data, self.pos = data, 0
+
+    def int32(self):
+        if self.pos + 4 > len(self.data):
+            raise SnssError("short payload")
+        (v,) = struct.unpack_from("<i", self.data, self.pos)
+        self.pos += 4
+        return v
+
+    def _blob(self, n):
+        if n < 0 or self.pos + n > len(self.data):
+            raise SnssError("short string")
+        v = self.data[self.pos:self.pos + n]
+        self.pos += (n + 3) & ~3
+        return v
+
+    def string(self):
+        return self._blob(self.int32()).decode("utf-8", "replace")
+
+    def string16(self):
+        return self._blob(2 * self.int32()).decode("utf-16-le", "replace")
+
+
+def read_snss_commands(data):
+    """(version, [(id, payload)], truncated) from the bytes of a session file.
+
+    A file Chromium is still writing can end in half a command; everything
+    before it is kept and ``truncated`` is True.
+    """
+    if len(data) < 8 or data[:4] != _SNSS_MAGIC:
+        raise SnssError("not a Chromium session file")
+    (version,) = struct.unpack_from("<i", data, 4)
+    if version not in _SNSS_PLAIN_VERSIONS:
+        raise SnssError(f"unsupported session file version {version}")
+    cmds, pos, truncated = [], 8, False
+    while pos < len(data):
+        if pos + 2 > len(data):
+            truncated = True
+            break
+        (size,) = struct.unpack_from("<H", data, pos)
+        if size == 0 or pos + 2 + size > len(data):
+            truncated = True
+            break
+        cmds.append((data[pos + 2], bytes(data[pos + 3:pos + 2 + size])))
+        pos += 2 + size
+    return version, cmds, truncated
+
+
+def replay_snss(cmds):
+    """Open windows from session commands, in the order Chromium listed them.
+
+    Each window: {"window_id", "type", "tabs": [{"url", "title", "pinned"}],
+    "active": index of the selected tab, "is_active", "user_title",
+    "app_name", "bounds", "order"}. Closed tabs and windows are dropped, and
+    so are windows without a tab (Chromium does the same when it restores).
+    A command that does not parse is skipped, never fatal.
+    """
+    windows, tabs = {}, {}
+    active_window = None
+
+    def win(wid):
+        if wid not in windows:
+            windows[wid] = {"window_id": wid, "type": CHROME_WINDOW_NORMAL, "selected": 0,
+                            "user_title": "", "app_name": "", "bounds": None,
+                            "order": len(windows)}
+        return windows[wid]
+
+    def tab(tid):
+        if tid not in tabs:
+            tabs[tid] = {"window": None, "index": 0, "navs": {}, "current": None,
+                         "pinned": False, "order": len(tabs)}
+        return tabs[tid]
+
+    def shift(navs, start, count):
+        out = {}
+        for k, v in navs.items():
+            if start <= k < start + count:
+                continue
+            out[k - count if k >= start + count else k] = v
+        return out
+
+    for cid, p in cmds:
+        try:
+            if cid == _SNSS_SET_TAB_WINDOW:
+                wid, tid = struct.unpack_from("<ii", p)
+                win(wid)
+                tab(tid)["window"] = wid
+            elif cid == _SNSS_SET_TAB_INDEX:
+                tid, idx = struct.unpack_from("<ii", p)
+                tab(tid)["index"] = idx
+            elif cid == _SNSS_UPDATE_NAVIGATION:
+                r = _SnssReader(p)
+                r.int32()  # pickle header: payload size
+                tid, idx = r.int32(), r.int32()
+                url = r.string()
+                try:
+                    title = r.string16()
+                except SnssError:
+                    title = ""
+                tab(tid)["navs"][idx] = (url[:_CHROME_MAX_URL], title[:_CHROME_MAX_TITLE])
+            elif cid == _SNSS_SET_SELECTED_NAVIGATION:
+                tid, idx = struct.unpack_from("<ii", p)
+                tab(tid)["current"] = idx
+            elif cid == _SNSS_SET_SELECTED_TAB:
+                wid, idx = struct.unpack_from("<ii", p)
+                win(wid)["selected"] = idx
+            elif cid == _SNSS_SET_WINDOW_TYPE:
+                wid, kind = struct.unpack_from("<ii", p)
+                win(wid)["type"] = kind
+            elif cid == _SNSS_SET_PINNED:
+                tid = struct.unpack_from("<i", p)[0]
+                tab(tid)["pinned"] = bool(p[4]) if len(p) > 4 else False
+            elif cid == _SNSS_SET_WINDOW_BOUNDS:
+                wid, x, y, w, h, state = struct.unpack_from("<iiiiii", p)
+                win(wid)["bounds"] = [x, y, w, h, state]
+            elif cid == _SNSS_SET_WINDOW_APP_NAME:
+                r = _SnssReader(p)
+                r.int32()
+                wid = r.int32()
+                win(wid)["app_name"] = r.string()[:_CHROME_MAX_TITLE]
+            elif cid == _SNSS_SET_WINDOW_USER_TITLE:
+                r = _SnssReader(p)
+                r.int32()
+                wid = r.int32()
+                win(wid)["user_title"] = r.string()[:_CHROME_MAX_TITLE]
+            elif cid == _SNSS_TAB_CLOSED:
+                tabs.pop(struct.unpack_from("<i", p)[0], None)
+            elif cid == _SNSS_WINDOW_CLOSED:
+                windows.pop(struct.unpack_from("<i", p)[0], None)
+            elif cid == _SNSS_SET_ACTIVE_WINDOW:
+                active_window = struct.unpack_from("<i", p)[0]
+            elif cid == _SNSS_PRUNED:
+                tid, start, count = struct.unpack_from("<iii", p)
+                t = tab(tid)
+                t["navs"] = shift(t["navs"], start, max(0, count))
+            elif cid == _SNSS_PRUNED_FROM_BACK:
+                tid, start = struct.unpack_from("<ii", p)
+                t = tab(tid)
+                t["navs"] = {k: v for k, v in t["navs"].items() if k < start}
+            elif cid == _SNSS_PRUNED_FROM_FRONT:
+                tid, count = struct.unpack_from("<ii", p)
+                t = tab(tid)
+                t["navs"] = shift(t["navs"], 0, max(0, count))
+        except (struct.error, SnssError, IndexError):
+            continue
+
+    out = []
+    for w in sorted(windows.values(), key=lambda w: w["order"]):
+        mine = sorted((t for t in tabs.values() if t["window"] == w["window_id"]),
+                      key=lambda t: (t["index"], t["order"]))
+        if not mine:
+            continue
+        sel = min(max(0, w["selected"]), len(mine) - 1)
+        rows, active = [], 0
+        for i, t in enumerate(mine):
+            if not t["navs"]:
+                continue
+            cur = t["current"] if t["current"] in t["navs"] else max(t["navs"])
+            url, title = t["navs"][cur]
+            if i == sel:
+                active = len(rows)
+            rows.append({"url": url, "title": title, "pinned": t["pinned"]})
+        if not rows:
+            continue
+        out.append({
+            "window_id": w["window_id"], "type": w["type"], "tabs": rows[:_CHROME_MAX_TABS],
+            "active": min(active, len(rows) - 1), "is_active": w["window_id"] == active_window,
+            "user_title": w["user_title"], "app_name": w["app_name"], "bounds": w["bounds"],
+            "order": len(out),
+        })
+    return out
+
+
+_SNSS_CACHE = {}
+_SNSS_LOGGED = set()
+
+
+def parse_snss_file(path):
+    """Open windows in one session file. Raises SnssError / OSError."""
+    st = os.stat(path)
+    key = (path, st.st_mtime_ns, st.st_size)
+    hit = _SNSS_CACHE.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    if st.st_size > _CHROME_SESSION_MAX_BYTES:
+        raise SnssError("session file too large")
+    with open(path, "rb") as f:
+        data = f.read(_CHROME_SESSION_MAX_BYTES + 1)
+    _version, cmds, _truncated = read_snss_commands(data)
+    wins = replay_snss(cmds)
+    _SNSS_CACHE[path] = (key, wins)
+    return wins
+
+
+def _session_files(directory):
+    """Session_* files of a profile, newest first."""
+    out = []
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return out
+    for name in names:
+        m = re.match(r"^Session_(\d+)$", name)
+        if m:
+            out.append((int(m.group(1)), os.path.join(directory, name)))
+    return [p for _s, p in sorted(out, reverse=True)]
+
+
+def chromium_profile_windows(user_data, profile):
+    """Windows Chromium lists as open for one profile (newest readable file).
+
+    A brand-new or half-written file with no window yet falls back to the
+    one before it. Errors are logged once per file version, never raised.
+    """
+    directory = os.path.join(user_data, profile, "Sessions")
+    for path in _session_files(directory)[:3]:
+        try:
+            wins = parse_snss_file(path)
+        except (OSError, SnssError) as e:
+            try:
+                mark = (path, os.stat(path).st_mtime_ns)
+            except OSError:
+                mark = (path, 0)
+            if mark not in _SNSS_LOGGED:
+                _SNSS_LOGGED.add(mark)
+                log(f"chrome: cannot read session file of profile {profile}: {e}")
+            continue
+        if wins:
+            return wins
+    return []
+
+
+def chromium_local_state(user_data):
+    try:
+        with open(os.path.join(user_data, "Local State")) as f:
+            ls = json.load(f)
+        return ls if isinstance(ls, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def chromium_fallback_profile(user_data):
+    """Profile to use when a window cannot be attributed: Local State's last_used."""
+    prof = (chromium_local_state(user_data).get("profile") or {})
+    last = prof.get("last_used") or ""
+    dirs = chromium_profile_dirs(user_data)
+    if isinstance(last, str) and PROFILE_DIR_RE.fullmatch(last) and (not dirs or last in dirs):
+        return last
+    return dirs[0] if dirs else "Default"
+
+
+def chromium_session_windows(user_data, profiles=None):
+    """Open browser windows of every profile, each tagged with its profile.
+
+    Windows of profiles Local State lists as active come first, so a closed
+    profile's leftover file loses ties.
+    """
+    if not user_data:
+        return []
+    ls = chromium_local_state(user_data)
+    active = (ls.get("profile") or {}).get("last_active_profiles") or []
+    profiles = list(profiles) if profiles is not None else chromium_profile_dirs(user_data)
+    out = []
+    for prof in profiles:
+        for w in chromium_profile_windows(user_data, prof):
+            if w.get("type") not in _CHROME_BROWSER_WINDOW_TYPES:
+                continue
+            out.append(dict(w, profile=prof, live_profile=prof in active))
+    return out
+
+
+def chrome_active_title(cw):
+    tabs = cw.get("tabs") or []
+    if not tabs:
+        return ""
+    return tabs[min(max(0, cw.get("active") or 0), len(tabs) - 1)].get("title") or ""
+
+
+def is_bare_browser_title(title):
+    """The window shows only the browser's name: no tab, e.g. the profile picker."""
+    return browser_title_key(title) in _BARE_BROWSER_TITLES
+
+
+def attribute_chrome_windows(clients, cwins):
+    """Tie each live Hyprland window to the Chromium window it shows.
+
+    ``clients`` are dicts with "address", "title" and optionally "stable"
+    (Hyprland's creation order). ``cwins`` come from chromium_session_windows.
+    The live window title is the selected tab's title right now, so it is
+    compared with the selected tab of each session window: an exact match of
+    the normalized title (browser suffix and unread counts dropped). If the
+    user switched tabs after Chromium last wrote its file, any tab of that
+    window may match instead, with lower priority. Windows with the same
+    title pair up in creation order. When every live window but one is
+    paired and exactly one session window is left, those two belong
+    together. Returns {address: {"window": cwin, "profile", "how"}}.
+    """
+    keyed = []
+    for ci, c in enumerate(clients):
+        k = browser_title_key(c.get("title"))
+        if k and k not in _BARE_BROWSER_TITLES:
+            keyed.append((ci, k))
+    order_c = sorted(range(len(clients)), key=lambda i: (clients[i].get("stable") or 0, i))
+    rank_c = {ci: r for r, ci in enumerate(order_c)}
+    win_keys = []
+    for w in cwins:
+        act = {browser_title_key(chrome_active_title(w))}
+        if w.get("user_title"):
+            act.add(browser_title_key(w["user_title"]))
+        act.discard("")
+        anyk = {browser_title_key(t.get("title")) for t in w.get("tabs") or []}
+        anyk.discard("")
+        win_keys.append((act, anyk))
+    # Rank among windows / clients that share a title, for ties.
+    same_c, same_w = {}, {}
+    for ci, k in sorted(keyed, key=lambda t: rank_c[t[0]]):
+        same_c.setdefault(k, []).append(ci)
+    for wi, w in sorted(enumerate(cwins), key=lambda t: (not t[1].get("live_profile", True),
+                                                          t[1].get("window_id") or 0)):
+        for k in win_keys[wi][0]:
+            same_w.setdefault(k, []).append(wi)
+    scored = []
+    for ci, k in keyed:
+        for wi, w in enumerate(cwins):
+            act, anyk = win_keys[wi]
+            if k in act:
+                score, how = 2, "title"
+            elif k in anyk:
+                score, how = 1, "tab-title"
+            else:
+                continue
+            rc = same_c[k].index(ci)
+            rw = same_w[k].index(wi) if wi in same_w.get(k, []) else len(same_w.get(k, []))
+            scored.append((-score, abs(rc - rw), not w.get("live_profile", True),
+                           rank_c[ci], w.get("order", 0), ci, wi, how))
+    scored.sort(key=lambda row: row[:5])
+    used_c, used_w, out = set(), set(), {}
+    for row in scored:
+        ci, wi, how = row[5], row[6], row[7]
+        if ci in used_c or wi in used_w:
+            continue
+        used_c.add(ci)
+        used_w.add(wi)
+        out[clients[ci].get("address")] = {"window": cwins[wi], "profile": cwins[wi]["profile"], "how": how}
+    left_c = [ci for ci, _k in keyed if ci not in used_c]
+    left_w = [wi for wi in range(len(cwins)) if wi not in used_w]
+    if len(cwins) == len(keyed) and len(left_c) == 1 and len(left_w) == 1:
+        ci, wi = left_c[0], left_w[0]
+        out[clients[ci].get("address")] = {"window": cwins[wi], "profile": cwins[wi]["profile"],
+                                           "how": "only-left"}
+    return out
+
+
+def chrome_tab_record(cw):
+    """What a saved window keeps about its Chromium window."""
+    return {
+        "tabs": [{"url": t.get("url") or "", "title": t.get("title") or ""}
+                 for t in (cw.get("tabs") or [])[:_CHROME_MAX_TABS]],
+        "active": int(cw.get("active") or 0),
+    }
+
+
+def normalize_tab_url(url):
+    """Compare URLs without their fragment, scheme case or a trailing slash."""
+    u = (url or "").strip()
+    if not u or _BLANK_URL_RE.match(u):
+        return ""
+    u = u.split("#", 1)[0]
+    scheme, sep, rest = u.partition("://")
+    if sep:
+        host, slash, path = rest.partition("/")
+        u = scheme.lower() + "://" + host.lower() + slash + path
+    return u.rstrip("/")
+
+
+def tab_url_set(tabs):
+    out = set()
+    for t in tabs or []:
+        n = normalize_tab_url(t.get("url") if isinstance(t, dict) else t)
+        if n:
+            out.add(n)
+    return out
+
+
+def tab_overlap(saved_tabs, live_tabs):
+    """(shared, jaccard) of two tab lists by normalized URL."""
+    a, b = tab_url_set(saved_tabs), tab_url_set(live_tabs)
+    if not a or not b:
+        return 0, 0.0
+    shared = len(a & b)
+    return shared, shared / len(a | b)
+
+
+def saved_chrome_tabs(w):
+    c = w.get("chrome") if isinstance(w, dict) else None
+    if not isinstance(c, dict) or not isinstance(c.get("tabs"), list):
+        return None
+    return c["tabs"]
+
+
+def match_saved_by_tabs(saved, live):
+    """Pair saved windows with live Chromium windows of the same profile.
+
+    ``saved`` are saved window records with a "chrome" tab list; ``live``
+    are dicts with "tabs" (from the session file) and "title". Pairs need
+    at least half of the smaller window's tabs in common; among those the
+    largest overlap wins, then the same selected-tab title. Returns
+    (saved_index, live_index, jaccard).
+    """
+    scored = []
+    for si, w in enumerate(saved):
+        st = saved_chrome_tabs(w) or []
+        a = tab_url_set(st)
+        for li, c in enumerate(live):
+            b = tab_url_set(c.get("tabs"))
+            if not a or not b:
+                continue
+            shared = len(a & b)
+            if shared == 0 or shared * 2 < min(len(a), len(b)):
+                continue
+            jac = shared / len(a | b)
+            same_title = browser_title_key(w.get("title")) == browser_title_key(c.get("title"))
+            scored.append((jac, shared, same_title, -abs(si - li), si, li))
+    scored.sort(reverse=True)
+    used_s, used_l, pairs = set(), set(), []
+    for jac, _shared, _t, _d, si, li in scored:
+        if si in used_s or li in used_l:
+            continue
+        used_s.add(si)
+        used_l.add(li)
+        pairs.append((si, li, jac))
+    return pairs
 
 
 def next_session_stamp(names):
@@ -2516,95 +2993,6 @@ def chromium_profile_dirs(user_data):
     return out
 
 
-def chromium_profile_emails(user_data):
-    """profile_dir → signed-in email (may be empty). Never returns tokens."""
-    try:
-        with open(os.path.join(user_data, "Local State")) as f:
-            info = (json.load(f).get("profile") or {}).get("info_cache") or {}
-    except (OSError, ValueError):
-        return {}
-    out = {}
-    for n, p in info.items():
-        if not PROFILE_DIR_RE.fullmatch(n) or not isinstance(p, dict):
-            continue
-        email = str(p.get("user_name") or "").strip()
-        out[n] = email
-    return out
-
-
-def _chromium_session_titles(user_data, profile):
-    """Title-like strings from the newest Session_*/Tabs_* files (UTF-8 and UTF-16LE)."""
-    sd = os.path.join(user_data, profile, "Sessions")
-    if not os.path.isdir(sd):
-        return []
-    files = sorted(
-        (os.path.join(sd, f) for f in os.listdir(sd)
-         if f.startswith("Session_") or f.startswith("Tabs_")),
-        key=lambda p: os.path.getmtime(p), reverse=True)
-    titles = set()
-    for path in files[:4]:
-        try:
-            if os.path.getsize(path) > 8_000_000:
-                continue
-            data = open(path, "rb").read()
-        except OSError:
-            continue
-        for m in re.finditer(rb"[ -~]{4,180}", data):
-            titles.add(m.group().decode())
-        for m in re.finditer(rb"(?:[\x20-\x7e]\x00){4,120}", data):
-            try:
-                titles.add(m.group().decode("utf-16-le"))
-            except UnicodeDecodeError:
-                pass
-    return list(titles)
-
-
-def match_chromium_profile(title, user_data, emails=None, title_cache=None):
-    """Which profile directory owns this window title, or None."""
-    if not title or not user_data:
-        return None
-    emails = emails if emails is not None else chromium_profile_emails(user_data)
-    low = title.lower()
-    for prof, email in emails.items():
-        if email and email.lower() in low:
-            return prof
-    # Fall back to titles embedded in each profile's session/tabs files.
-    # Score by the longest solid match so short tokens like "2026" or "YouTube"
-    # can't tie two profiles at 1.0.
-    if title_cache is None:
-        title_cache = {}
-    nt = norm_title(title)
-    if not nt or len(nt) < 3:
-        return None
-    best, best_score, second = None, 0.0, 0.0
-    for prof in chromium_profile_dirs(user_data):
-        if prof not in title_cache:
-            title_cache[prof] = _chromium_session_titles(user_data, prof)
-        score = 0.0
-        for st in title_cache[prof]:
-            ns = norm_title(st)
-            if not ns or len(ns) < 5:
-                continue
-            if nt == ns:
-                score = max(score, 1000 + len(ns))
-            elif ns in nt:
-                # session string is a tab title contained in the window title
-                score = max(score, 500 + len(ns))
-            elif nt in ns:
-                score = max(score, 400 + len(nt))
-            else:
-                r = difflib.SequenceMatcher(None, nt, ns).ratio()
-                if r >= 0.85:
-                    score = max(score, int(r * 300) + min(len(ns), len(nt)))
-        if score > best_score:
-            second, best_score, best = best_score, score, prof
-        elif score > second:
-            second = score
-    if best and best_score >= 405 and best_score > second:
-        return best
-    return None
-
-
 def with_profile_directory(argv, profile):
     """Return argv with --profile-directory set (and any prior value removed)."""
     if not profile or not PROFILE_DIR_RE.fullmatch(profile):
@@ -2612,6 +3000,78 @@ def with_profile_directory(argv, profile):
     out = [a for a in argv if not a.startswith("--profile-directory")]
     out.append("--profile-directory=" + profile)
     return out
+
+
+_GROUP_LOGGED = set()
+
+
+def _log_once(key, msg):
+    if key in _GROUP_LOGGED:
+        return
+    _GROUP_LOGGED.add(key)
+    log(msg)
+
+
+def previous_chrome_windows(path=None):
+    """stable id → saved window, from this Hyprland session's last save."""
+    try:
+        with open(path or SESSION) as f:
+            old = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(old, dict) or old.get("instance") != instance_sig():
+        return {}
+    out = {}
+    for it in old.get("items") or []:
+        if not isinstance(it, dict) or it.get("kind") != "browser":
+            continue
+        for w in it.get("windows") or []:
+            if isinstance(w, dict) and w.get("stable") and it.get("profile"):
+                out[w["stable"]] = {"profile": it["profile"], "chrome": w.get("chrome"),
+                                    "class": it.get("class") or ""}
+    return out
+
+
+def chromium_window_groups(wins, user_data, prev=None, cwins=None):
+    """[(profile, [window records])] for one Chromium browser's windows.
+
+    The profile and tabs of each window come from the profiles' session
+    files (attribute_chrome_windows). A window Chromium has not written
+    yet keeps what the previous save of this Hyprland session found;
+    otherwise it goes to Local State's last-used profile, so a profile
+    is never left empty.
+    """
+    prev = prev or {}
+    recs = [window_record(c) for c in wins]
+    if not user_data:
+        return [("", recs)]
+    if cwins is None:
+        cwins = chromium_session_windows(user_data)
+    att = attribute_chrome_windows(
+        [{"address": c.get("address"), "title": c.get("title") or "", "stable": r["stable"]}
+         for c, r in zip(wins, recs)], cwins)
+    by_prof = {}
+    for c, wr in zip(wins, recs):
+        a = att.get(c.get("address"))
+        if a:
+            prof = a["profile"]
+            wr["chrome"] = dict(chrome_tab_record(a["window"]), match=a["how"])
+        else:
+            old = prev.get(wr["stable"]) or {}
+            if old.get("profile"):
+                prof = old["profile"]
+                if isinstance(old.get("chrome"), dict):
+                    wr["chrome"] = dict(old["chrome"], match="previous")
+                _log_once(("prev", wr["stable"], prof),
+                          f"save: chrome window stable={wr['stable']} workspace={wr['workspace']} "
+                          f"is not in the session files yet; keeping its previous profile {prof}")
+            else:
+                prof = chromium_fallback_profile(user_data)
+                _log_once(("fallback", wr["stable"], prof),
+                          f"save: chrome window stable={wr['stable']} workspace={wr['workspace']} "
+                          f"is not in any profile's session file; using last-used profile {prof}")
+        by_prof.setdefault(prof, []).append(wr)
+    return list(by_prof.items())
 
 
 def window_record(c):
@@ -2673,6 +3133,7 @@ def snapshot(cfg):
 
     items = []
     browsers = {}
+    prev_chrome = None
     for pid, cs in by_pid.items():
         pargv, pexe = cmdline(pid), exe_of(pid)
         pbase = proc_basename(pargv, pexe)
@@ -2751,27 +3212,32 @@ def snapshot(cfg):
                 # Strip a stale --profile-directory from the process cmdline; we set it per group.
                 argv = [a for a in argv if not a.startswith("--profile-directory")]
                 ud = chromium_user_data(pbase, pexe, pargv, class_hint=cls)
-                emails = chromium_profile_emails(ud) if ud else {}
-                title_cache = {}
-                by_prof = {}
+                keep = []
+                cwins = chromium_session_windows(ud) if ud else []
+                known = attribute_chrome_windows(
+                    [{"address": c.get("address"), "title": c.get("title") or ""} for c in wins],
+                    cwins) if ud else {}
                 for c in wins:
-                    wr = window_record(c)
-                    prof = None
-                    # Prefer an explicit --profile-directory= on a per-window helper if present
-                    # (rare on Linux; multi-profile usually shares one browser process).
-                    if ud:
-                        prof = match_chromium_profile(wr["title"], ud, emails, title_cache)
-                    by_prof.setdefault(prof, []).append(wr)
-                for prof, pwins in by_prof.items():
+                    # Chromium's profile picker has no tab and is in no session file.
+                    if ud and is_bare_browser_title(c.get("title")) and c.get("address") not in known:
+                        skipped.append((cls, "browser window without a tab (profile picker)"))
+                        continue
+                    keep.append(c)
+                if not keep:
+                    continue
+                if prev_chrome is None:
+                    prev_chrome = previous_chrome_windows()
+                for prof, pwins in chromium_window_groups(keep, ud, prev_chrome, cwins):
                     pargv2 = with_profile_directory(argv, prof) if prof else list(argv)
                     key = (cls, tuple(pargv2))
                     if key not in browsers:
                         label = f", profile {prof}" if prof else ""
+                        how = ("browser reopens this profile's windows, matched by their tabs"
+                               if ud else "browser reopens its windows, matched by title")
                         browsers[key] = {
                             "kind": "browser", "class": cls, "argv": pargv2,
                             "profile": prof or "",
-                            "strategy": (strategy + label +
-                                         "; browser reopens this profile's windows, matched by title"),
+                            "strategy": strategy + label + "; " + how,
                             "windows": [],
                         }
                         items.append(browsers[key])
@@ -2882,6 +3348,15 @@ def snapshot(cfg):
                           "desktop_id": desk_e["id"] if desk_e else "",
                           "windows": [window_record(c) for c in wins]})
 
+    # A plain name for each saved Chromium window; restore pairs by tabs.
+    n_chrome = 0
+    for it in items:
+        if it.get("kind") != "browser":
+            continue
+        for w in sorted(it.get("windows") or [], key=lambda w: w.get("stable") or 0):
+            if isinstance(w.get("chrome"), dict):
+                n_chrome += 1
+                w["chrome"] = dict(w["chrome"], id=f"w{n_chrome}")
     display = display_fingerprint(monitors)
     mon_by_id = {m.get("id"): m for m in display["monitors"]}
     for it in items:
@@ -3230,7 +3705,7 @@ def load_session(path):
         raise ValueError(f"{path} is group/world writable; refusing")
     with open(path) as f:
         sess = json.load(f)
-    if not isinstance(sess, dict) or sess.get("format") != FORMAT or not isinstance(sess.get("items"), list):
+    if not isinstance(sess, dict) or sess.get("format") not in READ_FORMATS or not isinstance(sess.get("items"), list):
         raise ValueError(f"{path}: unknown format")
     for it in sess["items"]:
         a = it.get("argv")
@@ -3436,6 +3911,13 @@ def primary_ws(it):
 def print_plan(sess):
     use_uwsm = bool(shutil.which("uwsm-app"))
     hooked = hook_installed()
+    # Read-only view of which saved Chromium windows are open right now.
+    pairer = None
+    try:
+        pairer = Restorer(load_config())
+        pairer.sess = sess
+    except Exception:
+        pairer = None
     if not hooked:
         print("\nNote: the optional shell hook is not installed. Terminals still reopen in the"
               " shell's directory; install-hook only adds the same Atuin session and tab handoff.")
@@ -3445,10 +3927,34 @@ def print_plan(sess):
             ws = primary_ws(it)
             prof = it.get("profile") or ""
             who = f"profile {prof}" if prof else "default profile"
+            tabbed = any(saved_chrome_tabs(w) is not None for w in it["windows"])
             print(f"\n{n}. browser [{it['class']}] — launch {who} on workspace {ws}, "
-                  f"then place {len(it['windows'])} reopened windows by title ({it['strategy']}):")
+                  f"then place {len(it['windows'])} reopened windows by "
+                  f"{'their tabs' if tabbed else 'title'} ({it['strategy']}):")
+            open_now = {}
+            if tabbed and pairer is not None:
+                try:
+                    for c, w, jac in pairer.pair_open_chrome_windows(it):
+                        pairer.claimed.add(c.get("address"))
+                        open_now[id(w)] = (c, jac)
+                except Exception as e:
+                    print(f"     (cannot read the open Chromium windows: {e})")
             for w in it["windows"]:
-                print(f"     ws {ws_selector(w):>3}  {'floating ' if w['floating'] else ''}\"{w['title'][:70]}\"")
+                tabs = saved_chrome_tabs(w)
+                extra = ""
+                if tabs is not None:
+                    cid = (w.get("chrome") or {}).get("id") or "?"
+                    extra = f"  [{cid}, {len(tabs)} tab{'s' if len(tabs) != 1 else ''}"
+                    hit = open_now.get(id(w))
+                    if hit:
+                        c, jac = hit
+                        cws = ((c.get("workspace") or {}).get("id"))
+                        extra += f"; open now on ws {cws}, {jac:.0%} same tabs]"
+                    elif pairer is not None:
+                        extra += "; not open now]"
+                    else:
+                        extra += "]"
+                print(f"     ws {ws_selector(w):>3}  {'floating ' if w['floating'] else ''}\"{w['title'][:70]}\"{extra}")
             print("     (skipped only if this profile's windows are already open)")
             if prof and it.get("argv"):
                 ud = chromium_user_data(base(it["argv"][0]), "", it["argv"])
@@ -3506,7 +4012,14 @@ def relayout_existing(sess, cfg=None):
     placed = 0
     for it in sess.get("items") or []:
         cls = it.get("class") or ""
-        for w in it.get("windows") or []:
+        wins = list(it.get("windows") or [])
+        if it.get("kind") == "browser":
+            for c, w, _jac in r.pair_open_chrome_windows(it, live):
+                r.place(c, w)
+                placed += 1
+            # Tab-listed windows that did not pair are not open; leave them.
+            wins = [w for w in wins if saved_chrome_tabs(w) is None]
+        for w in wins:
             cands = [c for c in live
                      if c["address"] not in r.claimed
                      and (c.get("class") or c.get("initialClass") or "").lower() == cls.lower()]
@@ -3525,6 +4038,23 @@ def relayout_existing(sess, cfg=None):
     log(f"relayout: placed {placed} existing windows for "
         f"{(sess.get('display') or {}).get('label', '?')}")
     return placed
+
+
+def _stable_of(c):
+    try:
+        return int(str(c.get("stableId", "0")), 16)
+    except ValueError:
+        return 0
+
+
+def unmatched_tab_notes(saved, clients):
+    """Notes for saved windows that no live window's tabs matched."""
+    notes = []
+    for w in saved:
+        notes.append({"title": w.get("title") or "", "workspace": w.get("workspace"),
+                      "best": 0.0, "best_title": "", "best_profile": "",
+                      "candidates": len(clients), "profile_candidates": len(clients)})
+    return notes
 
 
 class Restorer:
@@ -3771,8 +4301,94 @@ class Restorer:
         self._prof_cache[mp] = prof
         return prof
 
+    def _chrome_user_data_by_class(self):
+        """Browser class → Chromium user-data dir, from the saved session."""
+        sess = getattr(self, "sess", None) or {}
+        cache = getattr(self, "_chrome_ud_cache", None)
+        if cache is not None and cache[0] is sess:
+            return cache[1]
+        out = {}
+        for it in sess.get("items") or []:
+            if it.get("kind") != "browser" or not it.get("argv"):
+                continue
+            ud = chromium_user_data(base(it["argv"][0]), "", it["argv"], class_hint=it.get("class") or "")
+            if ud:
+                out[(it.get("class") or "").lower()] = ud
+        self._chrome_ud_cache = (sess, out)
+        return out
+
+    def _chrome_attr(self, address=None):
+        """address → Chromium window and profile, from the live session files.
+
+        Reused for half a second unless a window it has not seen is asked
+        about; then the windows and session files are read again.
+        """
+        by_class = self._chrome_user_data_by_class()
+        if not by_class:
+            return {}
+        cache = getattr(self, "_chrome_attr_cache", None)
+        if cache and time.time() - cache[1] < 0.5 and (address is None or address in cache[3]):
+            return cache[2]
+        try:
+            live = self.clients()
+        except Exception:
+            return {}
+        sig = tuple(sorted((c.get("address"), c.get("title") or "") for c in live
+                           if (c.get("class") or c.get("initialClass") or "").lower() in by_class))
+        now = time.time()
+        if cache and cache[0] == sig and now - cache[1] < 2.0:
+            self._chrome_attr_cache = (sig, now, cache[2], cache[3])
+            return cache[2]
+        out = {}
+        for cls, ud in by_class.items():
+            cs = [c for c in live if (c.get("class") or c.get("initialClass") or "").lower() == cls]
+            if not cs:
+                continue
+            try:
+                cwins = chromium_session_windows(ud)
+                out.update(attribute_chrome_windows(
+                    [{"address": c.get("address"), "title": c.get("title") or "",
+                      "stable": _stable_of(c)} for c in cs], cwins))
+            except Exception as e:  # a bad session file must not stop the restore
+                log(f"restore: chrome session files unreadable: {e!r}")
+        self._chrome_attr_cache = (sig, now, out, {c.get("address") for c in live})
+        return out
+
+    def _chrome_window_of(self, c):
+        addr = (c or {}).get("address")
+        return self._chrome_attr(addr).get(addr)
+
+    def pair_open_chrome_windows(self, it, live=None):
+        """(client, saved window, jaccard) for a browser item's tab-listed
+        windows that are open right now. Reads only; moves nothing."""
+        tabbed = [w for w in it.get("windows") or [] if saved_chrome_tabs(w) is not None]
+        if not tabbed:
+            return []
+        prof = it.get("profile") or ""
+        cls = (it.get("class") or "").lower()
+        lv = []
+        for c in (live if live is not None else self.clients()):
+            if c.get("address") in self.claimed:
+                continue
+            if (c.get("class") or c.get("initialClass") or "").lower() != cls:
+                continue
+            a = self._chrome_window_of(c)
+            if a and (not prof or a["profile"] == prof):
+                lv.append((c, {"tabs": a["window"].get("tabs") or [], "title": c.get("title") or ""}))
+        return [(lv[li][0], tabbed[si], jac)
+                for si, li, jac in match_saved_by_tabs(tabbed, [x for _c, x in lv])]
+
+    def _is_profile_picker(self, c):
+        cls = (c.get("class") or c.get("initialClass") or "").lower()
+        if cls not in self._chrome_user_data_by_class():
+            return False
+        return is_bare_browser_title(c.get("title")) and not self._chrome_window_of(c)
+
     def _profile_of_client(self, c):
         cls = c.get("class") or c.get("initialClass") or ""
+        a = self._chrome_window_of(c) if c.get("address") else None
+        if a:
+            return a["profile"]
         return client_profile(
             self._process_profile(c), cls,
             saved_browser_profiles(getattr(self, "sess", None), cls))
@@ -3805,11 +4421,10 @@ class Restorer:
             browser = g.get("kind") == "browser"
             done = time.time() > g.get("deadline", 0) or final
             if cands and remaining:
-                pairs, notes = match_saved_windows(
-                    remaining, cands, g.get("profile") or "", desperate=done and not browser)
+                pairs, notes = self._match_group(g, remaining, cands, done)
                 g["last_notes"] = notes
-                matched = {wi for wi, _, _ in pairs}
-                for wi, ci, score in pairs:
+                matched = {wi for wi, _, _, _ in pairs}
+                for wi, ci, score, how in pairs:
                     self.place(cands[ci]["raw"], remaining[wi])
                     progressed = True
                     now = time.time()
@@ -3817,7 +4432,7 @@ class Restorer:
                         g["first_window_at"] = now
                     g["last_group_change"] = now
                     log(f"restore: matched class={g['class']} profile={g.get('profile') or '-'} "
-                        f"score={score:.2f} workspace={ws_selector(remaining[wi])} "
+                        f"by={how} score={score:.2f} workspace={ws_selector(remaining[wi])} "
                         f"title={clip_title(remaining[wi].get('title'))!r}")
                 g["remaining"] = [w for wi, w in enumerate(remaining) if wi not in matched]
                 if browser and g["remaining"]:
@@ -3834,6 +4449,82 @@ class Restorer:
                 log(summary, echo=True)
             self.pending.remove(g)
         return progressed
+
+    def _match_group(self, g, remaining, cands, done):
+        """Pair a group's missing saved windows with live candidates.
+
+        Saved Chromium windows that carry a tab list pair with live windows
+        of the same profile by their tabs (from Chromium's session files).
+        Saves from before 1.4 have no tab list and still match by title.
+        Returns ((saved_i, cand_i, score, how), ...), notes.
+        """
+        browser = g.get("kind") == "browser"
+        prof = g.get("profile") or ""
+        pairs = []
+        tabbed = [wi for wi, w in enumerate(remaining) if browser and saved_chrome_tabs(w) is not None]
+        if tabbed:
+            live = []
+            for ci, c in enumerate(cands):
+                a = self._chrome_window_of(c)
+                if not a or (prof and a["profile"] != prof):
+                    continue
+                live.append((ci, {"tabs": a["window"].get("tabs") or [], "title": c.get("title") or ""}))
+            for si, li, jac in match_saved_by_tabs([remaining[i] for i in tabbed], [x for _c, x in live]):
+                pairs.append((tabbed[si], live[li][0], jac, "tabs"))
+        notes = []
+        # Saves from before 1.4: match by title, as before.
+        legacy = [wi for wi in range(len(remaining)) if wi not in tabbed]
+        # Tab-listed windows whose live window never showed up in a session
+        # file: once the wait is over, try the title, but only against live
+        # windows that no session file claims (so no other window is taken).
+        late = [wi for wi in tabbed if done and wi not in {p[0] for p in pairs}]
+        for group, only_unknown in ((legacy, False), (late, True)):
+            if not group:
+                continue
+            used_c = {p[1] for p in pairs}
+            rest_c = [ci for ci in range(len(cands)) if ci not in used_c
+                      and not (only_unknown and self._chrome_window_of(cands[ci]))]
+            if not rest_c:
+                notes += unmatched_tab_notes([remaining[i] for i in group], [])
+                continue
+            tp, tnotes = match_saved_windows(
+                [remaining[i] for i in group], [cands[i] for i in rest_c],
+                prof, desperate=done and not browser)
+            notes += tnotes
+            for a, b, score in tp:
+                pairs.append((group[a], rest_c[b], score, "title"))
+        matched = {p[0] for p in pairs}
+        notes += unmatched_tab_notes(
+            [remaining[wi] for wi in tabbed if wi not in matched and wi not in late], cands)
+        return pairs, notes
+
+    def _close_profile_pickers(self, final=False):
+        """Close Chromium's profile picker if the restore made one appear.
+
+        It has no tab and is in no session file. A window still in that
+        state after a few seconds is not a window that is loading.
+        """
+        seen = getattr(self, "_picker_seen", None)
+        if seen is None:
+            self._picker_seen = seen = {}
+        now = time.time()
+        closed = 0
+        for c in self.clients():
+            addr = c.get("address")
+            if not addr or addr in self.claimed or addr in (getattr(self, "known", None) or set()):
+                continue
+            if not self._is_profile_picker(c):
+                seen.pop(addr, None)
+                continue
+            first = seen.setdefault(addr, now)
+            if now - first < 8 and not final:
+                continue
+            ok = dispatch(f"hl.dsp.window.close({{ window = {lua_long('address:' + addr)} }})")
+            log(f"restore: closed chromium profile picker addr={addr}{'' if ok else ' (dispatch failed)'}")
+            self.claimed.add(addr)
+            seen.pop(addr, None)
+            closed += 1
+        return closed
 
     def _claim_group_leftovers(self, g):
         # Do not swallow windows another profile's group still needs to place.
@@ -3862,6 +4553,14 @@ class Restorer:
             raw = c.get("raw") or {}
             title = c.get("title") or raw.get("title") or ""
             initial = raw.get("initialTitle") or ""
+            # The profile picker is no window of any profile; never use it.
+            if raw and self._is_profile_picker(raw):
+                continue
+            if is_bare_browser_title(title) and not (raw and self._chrome_window_of(raw)):
+                continue
+            a = self._chrome_window_of(raw) if raw else None
+            if a and g.get("profile") and a["profile"] != g.get("profile"):
+                continue
             if is_ntp_like_title(title) or is_ntp_like_title(initial):
                 ntps.append(c)
         if not ntps:
@@ -4084,6 +4783,7 @@ class Restorer:
         last_change = time.time()
         while self.pending:
             self.step_pending(final=False)
+            self._close_profile_pickers()
             if not self.pending:
                 break
             addrs = {c.get("address") for c in self.clients()}
@@ -4350,6 +5050,8 @@ class Restorer:
             cls = it.get("class") or ""
             prof = it.get("profile") or ""
             for w in it.get("windows") or []:
+                if it.get("kind") == "browser" and saved_chrome_tabs(w) is not None:
+                    continue
                 saved.append({
                     "class": cls, "profile": prof, "window": w,
                     "title": w.get("title") or "",
@@ -4418,13 +5120,27 @@ class Restorer:
             try:
                 if k == "browser":
                     prof = it.get("profile") or ""
+                    if not prof and it.get("argv"):
+                        ud0 = chromium_user_data(base(it["argv"][0]), "", it["argv"], class_hint=cls)
+                        if ud0:
+                            # Without --profile-directory a multi-profile Chromium
+                            # opens its profile picker instead of the session.
+                            prof = profile_from_argv(it["argv"]) or chromium_fallback_profile(ud0)
+                            it = dict(it, profile=prof, argv=with_profile_directory(it["argv"], prof))
+                            log(f"restore: {cls} saved without a profile; launching profile {prof} "
+                                "(Local State last_used)")
                     existing = self.unclaimed(cls, include_known=True)
                     annotated = [self._match_client(c) for c in existing]
-                    _pairs, notes = match_saved_windows(wins, annotated, prof)
-                    covered = not notes
+                    tabbed_n = sum(1 for w in wins if saved_chrome_tabs(w) is not None)
+                    if tabbed_n:
+                        covered = (tabbed_n == len(wins) and existing
+                                   and len(self.pair_open_chrome_windows(it, existing)) == len(wins))
+                    else:
+                        _pairs, notes = match_saved_windows(wins, annotated, prof)
+                        covered = not notes
                     snapshot = False
                     if existing and covered:
-                        log(f"restore: {cls} profile={prof or '-'} already has these windows; placing by title")
+                        log(f"restore: {cls} profile={prof or '-'} already has these windows; placing them")
                         self.known -= {c["address"] for c in existing}
                     else:
                         # Always launch per profile. Chromium's singleton opens the
@@ -4502,6 +5218,7 @@ class Restorer:
                 log(f"restore: {cls}: {e!r}")
                 self.failed.append(cls)
         self.wait_pending()
+        self._close_profile_pickers(final=True)
         self.place_named_windows()
         self.reorder_tiled(sess)
         if self.refocus and self.prev_focus:
