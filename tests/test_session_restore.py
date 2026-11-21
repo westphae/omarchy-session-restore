@@ -416,7 +416,37 @@ class MidUpgradeChromeTests(unittest.TestCase):
         self.assertFalse(m.would_lose_chrome_session(dropped, old))
 
 
+class PendingFinishTests(unittest.TestCase):
+    def test_can_finish_after_reopen_has_stopped(self):
+        r = m.Restorer.__new__(m.Restorer)
+        now = 1000.0
+        r.pending = [{"kind": "browser", "remaining": [{"title": "x"}],
+                      "reopen_after": now - 20, "reopen_stop": True,
+                      "reopen_attempts": 1, "reopen_budget": 2,
+                      "deadline": now + 40, "needs_launch": None}]
+        self.assertTrue(r._pending_can_finish(now))
+
+    def test_cannot_finish_before_reopen_after(self):
+        r = m.Restorer.__new__(m.Restorer)
+        now = 1000.0
+        r.pending = [{"kind": "browser", "remaining": [{"title": "x"}],
+                      "reopen_after": now + 10, "reopen_stop": False,
+                      "reopen_attempts": 0, "reopen_budget": 2,
+                      "deadline": now + 40, "needs_launch": None}]
+        self.assertFalse(r._pending_can_finish(now))
+
+    def test_cannot_finish_while_a_profile_is_still_deferred(self):
+        r = m.Restorer.__new__(m.Restorer)
+        now = 1000.0
+        r.pending = [{"kind": "browser", "remaining": [{"title": "x"}],
+                      "reopen_after": now - 1, "reopen_stop": True,
+                      "reopen_attempts": 1, "reopen_budget": 1,
+                      "deadline": now + 40, "needs_launch": ["/usr/bin/google-chrome-stable"]}]
+        self.assertFalse(r._pending_can_finish(now))
+
+
 class TerminalNameMatchTests(unittest.TestCase):
+
     """Two Ghostty windows must not be swapped just because both start as Ghostty."""
 
     def test_ghostty_initial_title_is_not_distinctive(self):

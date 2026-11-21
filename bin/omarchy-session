@@ -44,7 +44,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 # 2: Chromium windows carry their profile and tab list ("chrome"). 1 still loads.
 FORMAT = 2
 READ_FORMATS = (1, 2)
@@ -79,8 +79,8 @@ DEFAULTS = {
     "max_login_age_seconds": 900,  # only auto-restore this soon after Hyprland starts
     "save_interval_seconds": 60,
     "event_debounce_seconds": 3,
-    "browser_wait_seconds": 150,  # cap while waiting for late browser windows
-    "browser_settle_seconds": 12,  # quiet period before reopening closed browser windows
+    "browser_wait_seconds": 60,  # cap while waiting for late browser windows
+    "browser_settle_seconds": 4,  # quiet period before reopening closed browser windows
     "browser_primary_wait_seconds": 15,  # wait for the first Chromium process before launching other profiles
     "restore_chromium_session": True,  # after a clean exit, put back the pre-logout Chrome session
     "terminal_wait_seconds": 10,
@@ -4537,9 +4537,12 @@ class Restorer:
         # Saves from before 1.4: match by title, as before.
         legacy = [wi for wi in range(len(remaining)) if wi not in tabbed]
         # Tab-listed windows whose live window never showed up in a session
-        # file: once the wait is over, try the title, but only against live
+        # file cannot be paired by tabs. Match them by title against live
         # windows that no session file claims (so no other window is taken).
-        late = [wi for wi in tabbed if done and wi not in {p[0] for p in pairs}]
+        # This used to run only when the wait was over, so a visible window
+        # that Chromium left out of its session files sat unmatched until
+        # browser_wait_seconds expired.
+        late = [wi for wi in tabbed if wi not in {p[0] for p in pairs}]
         for group, only_unknown in ((legacy, False), (late, True)):
             if not group:
                 continue
@@ -4832,19 +4835,68 @@ class Restorer:
     def _extend_browser_deadlines(self):
         """Keep waiting while Chrome is still creating windows, up to the cap."""
         now = time.time()
-        settle = max(1, int(self.cfg.get("browser_settle_seconds", 12)))
+        settle = max(1, int(self.cfg.get("browser_settle_seconds", 4)))
         for g in self.pending:
             if g.get("kind") != "browser":
                 continue
             cap = g.get("deadline_cap", g.get("deadline", now))
             g["deadline"] = min(cap, max(g.get("deadline", now), now + settle))
 
+    def _pending_can_finish(self, now):
+        """True when remaining pending groups have had a fair chance to appear."""
+        if not self.pending:
+            return True
+        for g in self.pending:
+            if g.get("needs_launch"):
+                return False
+            if g.get("kind") != "browser":
+                if now <= g.get("deadline", 0) and g.get("remaining"):
+                    return False
+                continue
+            if now <= g.get("reopen_after", 0) and not g.get("reopen_stop"):
+                return False
+            # Still waiting to send Ctrl+Shift+T for a missing window.
+            if (g.get("remaining") and not g.get("reopen_stop")
+                    and g.get("reopen_attempts", 0) < g.get("reopen_budget", 0)
+                    and now <= g.get("deadline", 0)):
+                return False
+        return True
+
+    def _launch_deferred_profiles(self):
+        """Start a second Chrome profile only if its windows have not appeared.
+
+        The first profile already started the browser. Other profiles of the
+        same user-data dir are left pending so terminals and apps can launch
+        immediately. If --restore-last-session opened those windows, we never
+        launch the profile again.
+        """
+        now = time.time()
+        for g in list(self.pending):
+            argv = g.get("needs_launch")
+            if not argv or g.get("kind") != "browser":
+                continue
+            if not g.get("remaining"):
+                g["needs_launch"] = None
+                continue
+            if now < g.get("defer_launch_after", 0):
+                continue
+            prof = g.get("profile") or "-"
+            cls = g.get("class") or "chromium"
+            ws = g.get("launch_ws") or primary_ws({"windows": g.get("windows") or g.get("remaining") or [{}]})
+            log(f"restore: launching deferred chrome profile {prof}")
+            if not self.launch(argv, ws):
+                log(f"restore: {cls} profile={prof} deferred launch failed")
+                self.failed.append(cls)
+            g["needs_launch"] = None
+
     def wait_pending(self):
-        settle = max(1, int(self.cfg.get("browser_settle_seconds", 12)))
+        settle = max(1, int(self.cfg.get("browser_settle_seconds", 4)))
         last_addrs = {c.get("address") for c in self.clients()}
         last_change = time.time()
+        last_names = None
         while self.pending:
             self.step_pending(final=False)
+            self._launch_deferred_profiles()
             self._close_profile_pickers()
             if not self.pending:
                 break
@@ -4861,6 +4913,12 @@ class Restorer:
             if names != getattr(self, "_name_sig", None):
                 self._name_sig = names
                 self.place_named_windows()
+            if names != last_names:
+                # A title change is progress: the Healthchecks window became
+                # recognizable long before the old 150s deadline.
+                if last_names is not None:
+                    last_change = time.time()
+                last_names = names
             if not changed and time.time() - last_change >= settle:
                 for g in list(self.pending):
                     if g.get("kind") != "browser" or g.get("reopen_stop"):
@@ -4894,7 +4952,18 @@ class Restorer:
                         last_addrs = {c.get("address") for c in self.clients()}
                         g["last_group_change"] = last_change
                     break
-            time.sleep(0.4)
+            # If every browser group has had its reopen chance (or none is
+            # needed), windows have been quiet, and a title pass already ran
+            # in step_pending, do one last pass and stop. Do not sit until
+            # the cap for a window that is already visible or is not coming.
+            now = time.time()
+            if (now - last_change >= settle
+                    and self._pending_can_finish(now)
+                    and not any(g.get("needs_launch") for g in self.pending)):
+                self.step_pending(final=True)
+                self._close_profile_pickers(final=True)
+                break
+            time.sleep(0.25)
 
     def _note_browser_window_arrivals(self):
         """Track when each browser group's windows first appear / change."""
@@ -5206,6 +5275,7 @@ class Restorer:
                         _pairs, notes = match_saved_windows(wins, annotated, prof)
                         covered = not notes
                     snapshot = False
+                    needs_launch = None
                     if existing and covered:
                         log(f"restore: {cls} profile={prof or '-'} already has these windows; placing them")
                         self.known -= {c["address"] for c in existing}
@@ -5220,29 +5290,13 @@ class Restorer:
                         ud = chromium_user_data(base(argv[0]) if argv else "", "", argv)
                         # Snapshots were installed before any Chromium process
                         # started. Never copy Session files under a live browser.
+                        # If the browser is already up, do not wait here for this
+                        # profile's windows — that blocked terminals and other
+                        # apps. Defer a possible second launch to wait_pending.
+                        needs_launch = None
                         if ud and chromium_user_data_running(ud):
-                            settle = max(1, int(self.cfg.get("browser_settle_seconds", 12)))
-                            deadline = time.time() + settle
-                            while time.time() < deadline:
-                                existing = self.unclaimed(cls, include_known=True)
-                                annotated = [self._match_client(c) for c in existing]
-                                tabbed_n = sum(1 for w in wins if saved_chrome_tabs(w) is not None)
-                                if tabbed_n:
-                                    covered = (tabbed_n == len(wins) and existing
-                                               and len(self.pair_open_chrome_windows(it, existing)) == len(wins))
-                                else:
-                                    _pairs, notes = match_saved_windows(wins, annotated, prof)
-                                    covered = not notes
-                                if existing and covered:
-                                    log(f"restore: {cls} profile={prof or '-'} windows appeared "
-                                        f"from the first launch; not launching this profile again")
-                                    self.known -= {c["address"] for c in existing}
-                                    snapshot = False
-                                    argv = None
-                                    break
-                                time.sleep(0.3)
-                            else:
-                                argv = with_restore_last_session(argv)
+                            needs_launch = with_restore_last_session(argv)
+                            argv = None
                         else:
                             argv = with_restore_last_session(argv)
                         starting = bool(ud) and not chromium_user_data_running(ud)
@@ -5257,23 +5311,26 @@ class Restorer:
                                 "placing windows that are already open")
                         elif starting:
                             self._wait_chromium_started(ud, prof)
-                    wait = max(1, int(self.cfg.get("browser_wait_seconds", 150)))
-                    settle = max(1, int(self.cfg.get("browser_settle_seconds", 12)))
+                    wait = max(1, int(self.cfg.get("browser_wait_seconds", 60)))
+                    settle = max(1, int(self.cfg.get("browser_settle_seconds", 4)))
                     now = time.time()
                     # --restore-last-session (and Chrome's crash restore) open
                     # windows on their own. Give that a head start before
                     # Ctrl+Shift+T, whether or not we installed a sidecar —
                     # reopening too early duplicates tabs/windows.
-                    reopen_after = now + max(settle * 3, min(45, wait // 2))
+                    reopen_after = now + max(settle * 2, min(15, wait // 3))
                     self.pending.append({
                         "class": cls, "kind": "browser", "profile": prof,
                         "windows": list(wins), "remaining": list(wins), "snapshot": snapshot,
                         "deadline": now + wait, "deadline_cap": now + wait + wait // 2,
                         "reopen_after": reopen_after, "reopen_attempts": 0,
                         "reopen_budget": len(wins), "reopen_stop": False,
-                        "min_reopen_gap": max(8, settle),
+                        "min_reopen_gap": max(4, settle),
                         "first_window_at": None, "last_group_change": None,
                         "seen_addrs": [], "reopen_standin": None,
+                        "needs_launch": needs_launch,
+                        "defer_launch_after": (now + settle) if needs_launch else 0,
+                        "launch_ws": primary_ws(it),
                     })
                     continue
                 if k in ("app", "webapp"):

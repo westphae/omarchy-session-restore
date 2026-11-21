@@ -14,7 +14,7 @@ quietly and restores once on the next login.
 | | |
 |---|---|
 | **Plugin id** | `eric.session-restore` |
-| **Version** | 1.4.1 |
+| **Version** | 1.4.2 |
 | **License** | MIT |
 | **Author** | Eric Westphal ([@westphae](https://github.com/westphae)) |
 | **Based on** | [wbarakat/omarchy-session-restore](https://github.com/wbarakat/omarchy-session-restore) (MIT, © 2026 Waleed) |
@@ -520,6 +520,21 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
 ---
 
 ## Recent changes
+
+### 1.4.2
+- Restore no longer waits out the full browser timeout to place a Chrome
+  window that is already on screen but missing from Chromium's session
+  files. Those windows are matched by title as soon as they are visible,
+  instead of only when the wait expires. On a three-window desk this was
+  most of a two-and-a-half-minute restore.
+- The second Chrome profile is not launched in the middle of the item
+  loop, so terminals and other apps start as soon as the first profile
+  has started the browser. If that first launch already opened the other
+  profile's windows, the second launch is skipped. Session files are
+  still never copied under a live browser.
+- Quieter, shorter waits: settle 4s (was 12s), reopen after about 15s
+  (was 45s), and a 60s cap (was 150s), with an early finish once windows
+  have settled and reopen has had its chance.
 
 ### 1.4.1
 - Terminal windows are no longer swapped on restore just because every

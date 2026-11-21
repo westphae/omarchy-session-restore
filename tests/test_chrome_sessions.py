@@ -436,6 +436,21 @@ class RestorePairingTests(unittest.TestCase):
         pairs, _notes = r._match_group(g, saved, cands, done=False)
         self.assertEqual([(wi, how) for wi, _ci, _s, how in pairs], [(0, "title")])
 
+    def test_tab_listed_window_missing_from_session_files_matches_by_title_before_deadline(self):
+        """A live window Chromium left out of its session files used to wait
+        until done=True (the 150s cap) before title matching."""
+        clients = [{"address": "hc", "class": "google-chrome",
+                    "title": "2 down – Healthchecks.io - Google Chrome"}]
+        r = bare_restorer(clients)  # no session-file attribution
+        saved = [{"title": "2 down – Healthchecks.io - Google Chrome", "workspace": 2,
+                  "chrome": {"tabs": self.tabs("https://healthchecks.example/checks/")}}]
+        cands = [r._match_client(c) for c in clients]
+        g = {"kind": "browser", "class": "google-chrome", "profile": "Default"}
+        pairs, notes = r._match_group(g, saved, cands, done=False)
+        self.assertEqual([(wi, cands[ci]["address"], how) for wi, ci, _s, how in pairs],
+                         [(0, "hc", "title")])
+        self.assertEqual(notes, [])
+
     def test_tab_listed_window_does_not_take_another_profiles_window_by_title(self):
         clients = [{"address": "other", "class": "google-chrome", "title": "Board - Google Chrome"}]
         attr = {"other": {"profile": "Default", "how": "title",
