@@ -44,7 +44,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 # 2: Chromium windows carry their profile and tab list ("chrome"). 1 still loads.
 FORMAT = 2
 READ_FORMATS = (1, 2)
@@ -1709,6 +1709,12 @@ _EMAIL_RE = re.compile(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}")
 _GENERIC_TITLE = {
     "gmail", "youtube", "google", "google chrome", "chrome", "chromium",
     "new tab", "inbox", "google search", "untitled",
+    # App/bootstrap titles shared by every window of that app. Ghostty
+    # records initialTitle "Ghostty" on every window; treating that as
+    # distinctive made every pair of terminals score 1.0 and swapped them.
+    "ghostty", "kitty", "alacritty", "foot", "wezterm", "terminator",
+    "tilix", "konsole", "gnome-terminal", "xfce4-terminal", "ptyxis",
+    "terminal", "bash", "zsh", "fish", "tmux", "screen",
 }
 _TITLE_ACCEPT = 0.72
 _TITLE_ACCEPT_UNKNOWN_PROFILE = 0.88
@@ -2668,6 +2674,32 @@ def install_chromium_session(user_data, profile, running=False, enabled=True):
     return True, "installed"
 
 
+def preinstall_chromium_sessions(sess, enabled=True):
+    """Install every profile snapshot before any Chromium process is started.
+
+    Profiles of one browser share a user-data directory. Copying a second
+    profile's Session files after the process is already up races with
+    Chromium and can drop tabs or crash the browser (SIGTRAP).
+    """
+    results = []
+    seen_running = set()
+    for ud, prof in sess_chromium_profiles(sess):
+        try:
+            ud_key = os.path.realpath(ud)
+        except OSError:
+            ud_key = ud
+        if ud_key in seen_running or chromium_user_data_running(ud):
+            seen_running.add(ud_key)
+            log(f"restore: chrome profile {prof} session snapshot: already-running")
+            results.append((ud, prof, False, "already-running"))
+            continue
+        ok, why = install_chromium_session(
+            ud, prof, running=False, enabled=enabled)
+        log(f"restore: chrome profile {prof} session snapshot: {why}")
+        results.append((ud, prof, ok, why))
+    return results
+
+
 def chromium_profile_is_running(user_data, profile):
     """True when a Chromium browser process for this profile is already up."""
     try:
@@ -3460,6 +3492,32 @@ def would_collapse_chrome_profiles(old, new):
     return old_n >= 1 and new_n >= 1
 
 
+def chrome_window_count(sess):
+    return sum(len(it.get("windows") or []) for it in (sess or {}).get("items") or []
+               if it.get("kind") == "browser")
+
+
+def would_lose_chrome_session(old, new):
+    """True if an automatic save would drop Chrome windows or a profile.
+
+    After a mid-restore Chrome crash the live desk may have no browser
+    windows left. Writing that as session.json would make the next login
+    restore the crashed desk instead of the pre-reboot session.
+    """
+    if not old or not new:
+        return False
+    if would_collapse_chrome_profiles(old, new):
+        return True
+    old_n, new_n = chrome_window_count(old), chrome_window_count(new)
+    if old_n > 0 and new_n == 0:
+        return True
+    old_named = {p for p in chrome_browser_profiles(old) if p}
+    new_named = {p for p in chrome_browser_profiles(new) if p}
+    if old_named and (old_named - new_named) and new_n < old_n:
+        return True
+    return False
+
+
 def save(final=False, reason="manual"):
     cfg = load_config()
     if not cfg["enabled"]:
@@ -3487,10 +3545,14 @@ def save(final=False, reason="manual"):
                 old = json.load(f)
         except (OSError, ValueError):
             pass
-        if old and would_collapse_chrome_profiles(old, sess):
-            log(f"save ({reason}): refusing collapsed Chrome profiles "
-                f"(had {sorted(p for p in chrome_browser_profiles(old) if p)!r}, "
-                f"new {sorted(chrome_browser_profiles(sess))!r}); keeping previous",
+        lose = (would_lose_chrome_session(old, sess) if old and not final
+                else (old and would_collapse_chrome_profiles(old, sess)))
+        if lose:
+            log(f"save ({reason}): refusing collapsed Chrome session "
+                f"(had {sorted(p for p in chrome_browser_profiles(old) if p)!r} "
+                f"{chrome_window_count(old)} windows, "
+                f"new {sorted(chrome_browser_profiles(sess))!r} "
+                f"{chrome_window_count(sess)} windows); keeping previous",
                 echo=True)
             if final:
                 atomic_write(FREEZE, str(time.time() + 120), 0o600)
@@ -5114,6 +5176,11 @@ class Restorer:
             apply_workspace_layouts(sess)
         except Exception as e:
             log(f"restore: workspace layouts: {e!r}")
+        try:
+            preinstall_chromium_sessions(
+                sess, enabled=self.cfg.get("restore_chromium_session", True))
+        except Exception as e:
+            log(f"restore: chrome session preinstall: {e!r}")
         items = ordered_items(sess)
         for it in items:
             k, cls, wins = it["kind"], it["class"], it["windows"]
@@ -5151,16 +5218,37 @@ class Restorer:
                             self.known -= {c["address"] for c in existing}
                         argv = list(it["argv"])
                         ud = chromium_user_data(base(argv[0]) if argv else "", "", argv)
-                        if ud and prof:
-                            running = chromium_profile_is_running(ud, prof) or any(
-                                c.get("profile") == prof for c in annotated)
-                            snapshot, why = install_chromium_session(
-                                ud, prof, running=running,
-                                enabled=self.cfg.get("restore_chromium_session", True))
-                            log(f"restore: chrome profile {prof} session snapshot: {why}")
-                        argv = with_restore_last_session(argv)
+                        # Snapshots were installed before any Chromium process
+                        # started. Never copy Session files under a live browser.
+                        if ud and chromium_user_data_running(ud):
+                            settle = max(1, int(self.cfg.get("browser_settle_seconds", 12)))
+                            deadline = time.time() + settle
+                            while time.time() < deadline:
+                                existing = self.unclaimed(cls, include_known=True)
+                                annotated = [self._match_client(c) for c in existing]
+                                tabbed_n = sum(1 for w in wins if saved_chrome_tabs(w) is not None)
+                                if tabbed_n:
+                                    covered = (tabbed_n == len(wins) and existing
+                                               and len(self.pair_open_chrome_windows(it, existing)) == len(wins))
+                                else:
+                                    _pairs, notes = match_saved_windows(wins, annotated, prof)
+                                    covered = not notes
+                                if existing and covered:
+                                    log(f"restore: {cls} profile={prof or '-'} windows appeared "
+                                        f"from the first launch; not launching this profile again")
+                                    self.known -= {c["address"] for c in existing}
+                                    snapshot = False
+                                    argv = None
+                                    break
+                                time.sleep(0.3)
+                            else:
+                                argv = with_restore_last_session(argv)
+                        else:
+                            argv = with_restore_last_session(argv)
                         starting = bool(ud) and not chromium_user_data_running(ud)
-                        if not self.launch(argv, primary_ws(it)):
+                        if argv is None:
+                            pass
+                        elif not self.launch(argv, primary_ws(it)):
                             self.failed.append(cls)
                             if not existing:
                                 continue

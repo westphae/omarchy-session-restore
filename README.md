@@ -14,7 +14,7 @@ quietly and restores once on the next login.
 | | |
 |---|---|
 | **Plugin id** | `eric.session-restore` |
-| **Version** | 1.4.0 |
+| **Version** | 1.4.1 |
 | **License** | MIT |
 | **Author** | Eric Westphal ([@westphae](https://github.com/westphae)) |
 | **Based on** | [wbarakat/omarchy-session-restore](https://github.com/wbarakat/omarchy-session-restore) (MIT, © 2026 Waleed) |
@@ -520,6 +520,21 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
 ---
 
 ## Recent changes
+
+### 1.4.1
+- Terminal windows are no longer swapped on restore just because every
+  Ghostty window starts with the initial title "Ghostty". That name is
+  treated as generic, so two terminals are paired by their real titles
+  (for example a TUI on workspace 1 and a shell on workspace 3).
+- Chrome session snapshots for every profile are installed before the
+  browser process starts. 1.4.0 copied the second profile's Session
+  files after the first profile had already launched, which raced with
+  Chromium, dropped the other profile's tabs, and could crash Chrome.
+  If a later profile's windows appear from that first launch, it is not
+  launched again.
+- An automatic save no longer overwrites a session that still has Chrome
+  windows with one that has none, so a mid-restore Chrome crash does not
+  become the layout used on the next login.
 
 ### 1.4.0
 - Chrome windows are identified by their set of tabs, not by their title.

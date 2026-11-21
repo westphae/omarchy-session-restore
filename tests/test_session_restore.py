@@ -382,6 +382,73 @@ class MidUpgradeChromeTests(unittest.TestCase):
         self.assertFalse(m.would_collapse_chrome_profiles(old, old))
         self.assertFalse(m.would_collapse_chrome_profiles(collapsed, old))
 
+    def test_save_guard_refuses_chrome_disappearing_after_a_crash(self):
+        old = {"items": [
+            {"kind": "browser", "class": "google-chrome", "profile": "Default",
+             "windows": [{"title": "a"}, {"title": "b"}]},
+            {"kind": "browser", "class": "google-chrome", "profile": "Profile 1",
+             "windows": [{"title": "c"}]},
+            {"kind": "terminal", "class": "com.mitchellh.ghostty",
+             "windows": [{"title": "host: agenda"}]},
+        ]}
+        after_crash = {"items": [
+            {"kind": "terminal", "class": "com.mitchellh.ghostty",
+             "windows": [{"title": "host: agenda"}]},
+            {"kind": "app", "class": "com.tmog.taskmanager",
+             "windows": [{"title": "Task Manager"}]},
+        ]}
+        self.assertTrue(m.would_lose_chrome_session(old, after_crash))
+        self.assertFalse(m.would_collapse_chrome_profiles(old, after_crash))
+        self.assertFalse(m.would_lose_chrome_session(old, old))
+
+    def test_save_guard_refuses_dropping_a_profile(self):
+        old = {"items": [
+            {"kind": "browser", "class": "google-chrome", "profile": "Default",
+             "windows": [{"title": "a"}, {"title": "b"}]},
+            {"kind": "browser", "class": "google-chrome", "profile": "Profile 1",
+             "windows": [{"title": "c"}, {"title": "d"}]},
+        ]}
+        dropped = {"items": [
+            {"kind": "browser", "class": "google-chrome", "profile": "Default",
+             "windows": [{"title": "a"}]},
+        ]}
+        self.assertTrue(m.would_lose_chrome_session(old, dropped))
+        self.assertFalse(m.would_lose_chrome_session(dropped, old))
+
+
+class TerminalNameMatchTests(unittest.TestCase):
+    """Two Ghostty windows must not be swapped just because both start as Ghostty."""
+
+    def test_ghostty_initial_title_is_not_distinctive(self):
+        self.assertFalse(m.distinctive_name("Ghostty"))
+        self.assertFalse(m.distinctive_name("kitty"))
+
+    def test_two_ghostty_windows_pair_by_real_title_not_initial(self):
+        saved = [
+            {"class": "com.mitchellh.ghostty", "profile": "",
+             "title": "eric@host:~/downloads/project", "initial_title": "Ghostty",
+             "xdg_tag": "", "workspace": 3},
+            {"class": "com.mitchellh.ghostty", "profile": "",
+             "title": "host: agenda", "initial_title": "Ghostty",
+             "xdg_tag": "", "workspace": 1},
+        ]
+        live = [
+            {"class": "com.mitchellh.ghostty", "profile": "",
+             "title": "host: agenda", "initialTitle": "Ghostty", "xdgTag": ""},
+            {"class": "com.mitchellh.ghostty", "profile": "",
+             "title": "~/Downloads", "initialTitle": "Ghostty", "xdgTag": ""},
+        ]
+        # Shared "Ghostty" initial titles must not score as a perfect match.
+        self.assertLess(
+            m.window_name_score(saved[0], live[0]), m._TITLE_ACCEPT)
+        self.assertGreaterEqual(
+            m.window_name_score(saved[1], live[0]), m._TITLE_ACCEPT)
+        self.assertGreaterEqual(
+            m.window_name_score(saved[0], live[1]), m._TITLE_ACCEPT)
+        pairs = m.match_windows_by_name(saved, live)
+        by_saved = {si: ci for si, ci, _score in pairs}
+        self.assertEqual(by_saved[0], 1)  # downloads <-> ~/Downloads
+        self.assertEqual(by_saved[1], 0)  # agenda <-> host: agenda
 
 
 class NtpStandinTests(unittest.TestCase):
