@@ -444,6 +444,20 @@ class PendingFinishTests(unittest.TestCase):
                       "deadline": now + 40, "needs_launch": ["/usr/bin/google-chrome-stable"]}]
         self.assertFalse(r._pending_can_finish(now))
 
+    def test_cannot_finish_while_tab_listed_windows_wait_for_session_files(self):
+        r = m.Restorer.__new__(m.Restorer)
+        r._chrome_sessions_seen_at = None
+        now = 1000.0
+        r.pending = [{"kind": "browser",
+                      "remaining": [{"title": "Healthchecks.io",
+                                     "chrome": {"tabs": [{"url": "https://h.example/", "title": "Healthchecks.io"}]}}],
+                      "reopen_after": now - 20, "reopen_stop": True,
+                      "reopen_attempts": 1, "reopen_budget": 1,
+                      "deadline": now + 40, "needs_launch": None}]
+        self.assertFalse(r._pending_can_finish(now))
+        r._chrome_sessions_seen_at = now - 10
+        self.assertTrue(r._pending_can_finish(now))
+
 
 class TerminalNameMatchTests(unittest.TestCase):
 

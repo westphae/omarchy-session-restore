@@ -44,7 +44,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 # 2: Chromium windows carry their profile and tab list ("chrome"). 1 still loads.
 FORMAT = 2
 READ_FORMATS = (1, 2)
@@ -1718,6 +1718,12 @@ _GENERIC_TITLE = {
 }
 _TITLE_ACCEPT = 0.72
 _TITLE_ACCEPT_UNKNOWN_PROFILE = 0.88
+# Seconds to wait after session files have been seen before a tab-listed
+# window may be placed by title. Gives a slow SNSS write a chance to land
+# so tab-set matching stays the primary path.
+_TITLE_FALLBACK_GRACE = 3.0
+_TITLE_FALLBACK_MIN_LEN = 6
+_TITLE_FALLBACK_TOKEN_LEN = 8
 # Different mailboxes share the "Inbox (…) - …" shape. Cap that score under
 # every accept threshold so one profile cannot take the other's window.
 _TITLE_EMAIL_CONFLICT = 0.35
@@ -1858,6 +1864,148 @@ def match_saved_windows(saved, clients, profile="", desperate=False):
         best_s, best_t, best_p = 0.0, "", ""
         for c in clients:
             s = title_similarity(w.get("title"), c.get("title"))
+            if s >= best_s:
+                best_s, best_t, best_p = s, c.get("title") or "", c.get("profile") or ""
+        notes.append({
+            "title": w.get("title") or "",
+            "workspace": w.get("workspace"),
+            "best": best_s,
+            "best_title": best_t,
+            "best_profile": best_p,
+            "candidates": len(clients),
+            "profile_candidates": len(eligible),
+        })
+    return pairs, notes
+
+
+def distinctive_title_key(title):
+    """Normalized title that is safe to use as a mid-restore identity.
+
+    Short or generic keys ("jay", "Inbox", "New Tab") are how title
+    matching used to claim the wrong window when the selected tab changed.
+    """
+    if is_ntp_like_title(title):
+        return ""
+    key = browser_title_key(title)
+    if not key or key in _GENERIC_TITLE or len(key) < _TITLE_FALLBACK_MIN_LEN:
+        return ""
+    return key
+
+
+def distinctive_title_tokens(key):
+    """Long, non-generic tokens of a normalized title (domains stay intact)."""
+    if not key:
+        return []
+    out = []
+    for tok in re.split(r"[^a-z0-9.]+", key):
+        if tok and tok not in _GENERIC_TITLE and len(tok) >= _TITLE_FALLBACK_MIN_LEN:
+            out.append(tok)
+    return out
+
+
+def saved_window_title_keys(w):
+    """Distinctive keys for the window title and every saved tab title.
+
+    The saved window title is the selected tab at save time. Restore may
+    show a different tab, so fallback also considers the other tab titles
+    recorded with the window.
+    """
+    keys, seen = [], set()
+    titles = [w.get("title") or ""]
+    for t in saved_chrome_tabs(w) or []:
+        if isinstance(t, dict):
+            titles.append(t.get("title") or "")
+    for title in titles:
+        k = distinctive_title_key(title)
+        if k and k not in seen:
+            seen.add(k)
+            keys.append(k)
+    return keys
+
+
+def title_fallback_score(saved_w, live_title):
+    """1.0 exact distinctive title, 0.9 a strong unique-looking contain.
+
+    Fuzzy mid-range scores are not used: a partial match of a changing
+    active-tab title is how the wrong window gets claimed.
+    """
+    live = distinctive_title_key(live_title)
+    if not live:
+        return 0.0
+    best = 0.0
+    live_toks = set(distinctive_title_tokens(live))
+    for k in saved_window_title_keys(saved_w):
+        if k == live:
+            return 1.0
+        shorter, longer = (live, k) if len(live) <= len(k) else (k, live)
+        if len(shorter) >= _TITLE_FALLBACK_TOKEN_LEN and _title_has_token(longer, shorter):
+            best = max(best, 0.9)
+        shared = live_toks & set(distinctive_title_tokens(k))
+        if any(len(t) >= _TITLE_FALLBACK_TOKEN_LEN for t in shared):
+            best = max(best, 0.9)
+    return best
+
+
+def title_fallback_ready(seen_at, now=None, done=False, grace=_TITLE_FALLBACK_GRACE):
+    """When tab-listed windows may be placed by title.
+
+    Mid-wait, only after Chromium session files have been seen and a short
+    grace has passed. At the wait deadline, title fallback may run even if
+    the files never appeared.
+    """
+    if done:
+        return True
+    if seen_at is None:
+        return False
+    return (now if now is not None else time.time()) - seen_at >= grace
+
+
+def match_tab_listed_by_title(saved, clients, profile="", other_saved=None):
+    """Title fallback for tab-listed windows missing from the session files.
+
+    Accepts only a unique, distinctive, exact or strong-contain match in
+    the same profile. Ambiguous or generic titles are left unmatched.
+    ``other_saved`` are windows of another profile of the same browser:
+    a live title that also matches one of those is left unmoved.
+    Returns (pairs, notes) in the same shape as match_saved_windows.
+    """
+    eligible = []
+    for i, c in enumerate(clients):
+        cp = c.get("profile") or ""
+        if profile and cp and cp != profile:
+            continue
+        eligible.append(i)
+    scores = {}
+    conflicted = set()  # live client indexes that also match another profile
+    others = list(other_saved or [])
+    for ci in eligible:
+        live_title = clients[ci].get("title")
+        if others and any(title_fallback_score(w, live_title) >= 0.9 for w in others):
+            conflicted.add(ci)
+            continue
+        for wi, w in enumerate(saved):
+            s = title_fallback_score(w, live_title)
+            if s >= 0.9:
+                scores[(wi, ci)] = s
+    used_w, used_c, pairs = set(), set(), []
+    for (wi, ci), s in sorted(scores.items(), key=lambda kv: -kv[1]):
+        if wi in used_w or ci in used_c:
+            continue
+        # Unique on both sides: do not guess between similar titles.
+        if any(wj == wi and cj != ci and sj >= s for (wj, cj), sj in scores.items()):
+            continue
+        if any(cj == ci and wj != wi and sj >= s for (wj, cj), sj in scores.items()):
+            continue
+        used_w.add(wi)
+        used_c.add(ci)
+        pairs.append((wi, ci, s))
+    notes = []
+    for wi, w in enumerate(saved):
+        if wi in used_w:
+            continue
+        best_s, best_t, best_p = 0.0, "", ""
+        for c in clients:
+            s = title_fallback_score(w, c.get("title"))
             if s >= best_s:
                 best_s, best_t, best_p = s, c.get("title") or "", c.get("profile") or ""
         notes.append({
@@ -4132,6 +4280,7 @@ class Restorer:
         self._prof_cache = {}
         self.hooked = hook_installed()
         self.refocus = None
+        self._chrome_sessions_seen_at = None
         try:
             self.prev_focus = (hypr_json("activewindow") or {}).get("address")
         except Exception:
@@ -4408,6 +4557,12 @@ class Restorer:
                 continue
             try:
                 cwins = chromium_session_windows(ud)
+                # Files present (even if this pass listed no windows) means
+                # "not in the file" is a real signal, not a slow first write.
+                if cwins or any(_session_files(os.path.join(ud, prof, "Sessions"))
+                                for prof in (chromium_profile_dirs(ud) or ["Default"])):
+                    if getattr(self, "_chrome_sessions_seen_at", None) is None:
+                        self._chrome_sessions_seen_at = now
                 out.update(attribute_chrome_windows(
                     [{"address": c.get("address"), "title": c.get("title") or "",
                       "stable": _stable_of(c)} for c in cs], cwins))
@@ -4512,6 +4667,24 @@ class Restorer:
             self.pending.remove(g)
         return progressed
 
+    def _title_fallback_ready(self, done, now=None):
+        """True when tab-listed windows may be placed by title."""
+        return title_fallback_ready(
+            getattr(self, "_chrome_sessions_seen_at", None), now=now, done=done)
+
+    def _other_profile_saved_windows(self, g):
+        """Saved Chrome windows of the same class that belong to another profile."""
+        prof = g.get("profile") or ""
+        cls = g.get("class") or ""
+        out = []
+        for it in (getattr(self, "sess", None) or {}).get("items") or []:
+            if it.get("kind") != "browser" or (it.get("class") or "") != cls:
+                continue
+            if (it.get("profile") or "") == prof:
+                continue
+            out.extend(it.get("windows") or [])
+        return out
+
     def _match_group(self, g, remaining, cands, done):
         """Pair a group's missing saved windows with live candidates.
 
@@ -4537,12 +4710,15 @@ class Restorer:
         # Saves from before 1.4: match by title, as before.
         legacy = [wi for wi in range(len(remaining)) if wi not in tabbed]
         # Tab-listed windows whose live window never showed up in a session
-        # file cannot be paired by tabs. Match them by title against live
-        # windows that no session file claims (so no other window is taken).
-        # This used to run only when the wait was over, so a visible window
-        # that Chromium left out of its session files sat unmatched until
-        # browser_wait_seconds expired.
+        # file cannot be paired by tabs. After session files have been seen
+        # (and a short grace), match them by a unique distinctive title
+        # against live windows that no session file claims. Running that
+        # fallback immediately would let a changing active-tab title claim
+        # a window whose session data was only late to become readable.
         late = [wi for wi in tabbed if wi not in {p[0] for p in pairs}]
+        if late and not self._title_fallback_ready(done):
+            late = []
+        other_saved = self._other_profile_saved_windows(g) if late else []
         for group, only_unknown in ((legacy, False), (late, True)):
             if not group:
                 continue
@@ -4552,9 +4728,14 @@ class Restorer:
             if not rest_c:
                 notes += unmatched_tab_notes([remaining[i] for i in group], [])
                 continue
-            tp, tnotes = match_saved_windows(
-                [remaining[i] for i in group], [cands[i] for i in rest_c],
-                prof, desperate=done and not browser)
+            if only_unknown:
+                tp, tnotes = match_tab_listed_by_title(
+                    [remaining[i] for i in group], [cands[i] for i in rest_c],
+                    prof, other_saved=other_saved)
+            else:
+                tp, tnotes = match_saved_windows(
+                    [remaining[i] for i in group], [cands[i] for i in rest_c],
+                    prof, desperate=done and not browser)
             notes += tnotes
             for a, b, score in tp:
                 pairs.append((group[a], rest_c[b], score, "title"))
@@ -4858,6 +5039,13 @@ class Restorer:
             # Still waiting to send Ctrl+Shift+T for a missing window.
             if (g.get("remaining") and not g.get("reopen_stop")
                     and g.get("reopen_attempts", 0) < g.get("reopen_budget", 0)
+                    and now <= g.get("deadline", 0)):
+                return False
+            # Tab-listed windows still unmatched: give session files and the
+            # title-fallback grace a chance before finishing early (which
+            # would place them by title as if the wait were over).
+            if (any(saved_chrome_tabs(w) is not None for w in g.get("remaining") or [])
+                    and not self._title_fallback_ready(False, now=now)
                     and now <= g.get("deadline", 0)):
                 return False
         return True

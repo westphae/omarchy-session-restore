@@ -14,7 +14,7 @@ quietly and restores once on the next login.
 | | |
 |---|---|
 | **Plugin id** | `eric.session-restore` |
-| **Version** | 1.4.2 |
+| **Version** | 1.4.3 |
 | **License** | MIT |
 | **Author** | Eric Westphal ([@westphae](https://github.com/westphae)) |
 | **Based on** | [wbarakat/omarchy-session-restore](https://github.com/wbarakat/omarchy-session-restore) (MIT, © 2026 Waleed) |
@@ -520,6 +520,17 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
 ---
 
 ## Recent changes
+
+### 1.4.3
+- Title fallback for a Chrome window missing from the session files no
+  longer runs the instant the window appears. Tab-set matching stays the
+  primary path: the fallback waits until those files have been read and a
+  short grace has passed, so a slow session-file write cannot be claimed
+  by the current tab's title. The match itself must be a unique,
+  distinctive title (the saved window title or any of its tab titles) in
+  the same profile. Short or generic names such as "jay", "New Tab", or
+  "Inbox", and two windows with similar titles, are left unmoved rather
+  than guessed.
 
 ### 1.4.2
 - Restore no longer waits out the full browser timeout to place a Chrome

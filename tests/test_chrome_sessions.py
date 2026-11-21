@@ -385,7 +385,7 @@ class SaveGroupingTests(unittest.TestCase):
         self.assertEqual(m.chromium_fallback_profile(self.ud), "Default")
 
 
-def bare_restorer(clients, attr=None, sess=None):
+def bare_restorer(clients, attr=None, sess=None, sessions_ready=False):
     r = m.Restorer.__new__(m.Restorer)
     r.cfg = {}
     r.claimed = set()
@@ -403,12 +403,15 @@ def bare_restorer(clients, attr=None, sess=None):
     r._chrome_attr = lambda address=None, _a=attr: _a
     r._chrome_user_data_by_class = lambda: {"google-chrome": "/nonexistent"}
     r._move_to_workspace = lambda c, w, cls: True
+    r._chrome_sessions_seen_at = (time.time() - 60) if sessions_ready else None
     return r
 
 
 class RestorePairingTests(unittest.TestCase):
-    def tabs(self, *urls):
-        return [{"url": u, "title": ""} for u in urls]
+    def tabs(self, *urls, titles=None):
+        if titles is None:
+            titles = [""] * len(urls)
+        return [{"url": u, "title": t} for u, t in zip(urls, titles)]
 
     def test_tab_listed_windows_pair_by_tabs_within_their_profile(self):
         clients = [{"address": "p1", "class": "google-chrome", "title": "Mail - Google Chrome"},
@@ -437,11 +440,11 @@ class RestorePairingTests(unittest.TestCase):
         self.assertEqual([(wi, how) for wi, _ci, _s, how in pairs], [(0, "title")])
 
     def test_tab_listed_window_missing_from_session_files_matches_by_title_before_deadline(self):
-        """A live window Chromium left out of its session files used to wait
-        until done=True (the 150s cap) before title matching."""
+        """A live window Chromium left out of its session files is title-
+        matched once those files have been seen, without waiting for the cap."""
         clients = [{"address": "hc", "class": "google-chrome",
                     "title": "2 down – Healthchecks.io - Google Chrome"}]
-        r = bare_restorer(clients)  # no session-file attribution
+        r = bare_restorer(clients, sessions_ready=True)  # files seen; this window is not in them
         saved = [{"title": "2 down – Healthchecks.io - Google Chrome", "workspace": 2,
                   "chrome": {"tabs": self.tabs("https://healthchecks.example/checks/")}}]
         cands = [r._match_client(c) for c in clients]
@@ -450,6 +453,185 @@ class RestorePairingTests(unittest.TestCase):
         self.assertEqual([(wi, cands[ci]["address"], how) for wi, ci, _s, how in pairs],
                          [(0, "hc", "title")])
         self.assertEqual(notes, [])
+
+    def test_tab_listed_window_waits_for_session_files_before_title_fallback(self):
+        """A unique title must not claim a window whose session data is only late."""
+        clients = [{"address": "hc", "class": "google-chrome",
+                    "title": "2 down – Healthchecks.io - Google Chrome"}]
+        r = bare_restorer(clients)  # session files not seen yet
+        saved = [{"title": "2 down – Healthchecks.io - Google Chrome", "workspace": 2,
+                  "chrome": {"tabs": self.tabs("https://healthchecks.example/checks/")}}]
+        cands = [r._match_client(c) for c in clients]
+        g = {"kind": "browser", "class": "google-chrome", "profile": "Default"}
+        pairs, notes = r._match_group(g, saved, cands, done=False)
+        self.assertEqual(pairs, [])
+        self.assertTrue(notes)
+        # Once the wait is over, a unique distinctive title may still place it.
+        pairs, notes = r._match_group(g, saved, cands, done=True)
+        self.assertEqual([(wi, cands[ci]["address"], how) for wi, ci, _s, how in pairs],
+                         [(0, "hc", "title")])
+
+    def test_title_fallback_waits_out_the_grace_after_session_files_appear(self):
+        clients = [{"address": "hc", "class": "google-chrome",
+                    "title": "2 down – Healthchecks.io - Google Chrome"}]
+        r = bare_restorer(clients)
+        r._chrome_sessions_seen_at = time.time()  # just now; grace has not elapsed
+        saved = [{"title": "2 down – Healthchecks.io - Google Chrome", "workspace": 2,
+                  "chrome": {"tabs": self.tabs("https://healthchecks.example/checks/")}}]
+        cands = [r._match_client(c) for c in clients]
+        g = {"kind": "browser", "class": "google-chrome", "profile": "Default"}
+        pairs, _notes = r._match_group(g, saved, cands, done=False)
+        self.assertEqual(pairs, [])
+
+    def test_title_fallback_matches_a_different_active_tab_than_was_saved(self):
+        clients = [{"address": "w", "class": "google-chrome",
+                    "title": "Docs draft - Google Chrome"}]
+        r = bare_restorer(clients, sessions_ready=True)
+        saved = [{"title": "Inbox – Mail - Google Chrome", "workspace": 2,
+                  "chrome": {"tabs": self.tabs(
+                      "https://mail.example/", "https://docs.example/draft",
+                      titles=["Inbox – Mail", "Docs draft"])}}]
+        cands = [r._match_client(c) for c in clients]
+        g = {"kind": "browser", "class": "google-chrome", "profile": "Default"}
+        pairs, notes = r._match_group(g, saved, cands, done=False)
+        self.assertEqual([(wi, cands[ci]["address"], how) for wi, ci, _s, how in pairs],
+                         [(0, "w", "title")])
+        self.assertEqual(notes, [])
+
+    def test_title_fallback_does_not_guess_when_the_active_tab_fits_two_windows(self):
+        """Live title is window 2's saved title and also a tab of window 1."""
+        clients = [{"address": "live", "class": "google-chrome",
+                    "title": "Project board - Google Chrome"}]
+        r = bare_restorer(clients, sessions_ready=True)
+        saved = [
+            {"title": "Inbox – Mail - Google Chrome", "workspace": 2,
+             "chrome": {"tabs": self.tabs(
+                 "https://mail.example/", "https://board.example/",
+                 titles=["Inbox – Mail", "Project board"])}},
+            {"title": "Project board - Google Chrome", "workspace": 3,
+             "chrome": {"tabs": self.tabs("https://board.example/",
+                                          titles=["Project board"])}},
+        ]
+        cands = [r._match_client(c) for c in clients]
+        g = {"kind": "browser", "class": "google-chrome", "profile": "Default"}
+        pairs, notes = r._match_group(g, saved, cands, done=False)
+        self.assertEqual(pairs, [])
+        self.assertEqual(len(notes), 2)
+
+    def test_title_fallback_rejects_short_or_generic_titles(self):
+        cases = [
+            "jay - Google Chrome",
+            "New Tab - Google Chrome",
+            "Inbox - Google Chrome",
+            "Gmail - Google Chrome",
+            "YouTube - Google Chrome",
+            "Google Chrome",
+        ]
+        for title in cases:
+            with self.subTest(title=title):
+                clients = [{"address": "w", "class": "google-chrome", "title": title}]
+                r = bare_restorer(clients, sessions_ready=True)
+                saved = [{"title": title, "workspace": 2,
+                          "chrome": {"tabs": self.tabs("https://example/", titles=[title])}}]
+                cands = [r._match_client(c) for c in clients]
+                g = {"kind": "browser", "class": "google-chrome", "profile": "Default"}
+                for done in (False, True):
+                    pairs, notes = r._match_group(g, saved, cands, done=done)
+                    self.assertEqual(pairs, [], f"{title!r} done={done}")
+                    self.assertEqual(len(notes), 1)
+
+    def test_title_fallback_leaves_duplicate_titles_unmoved(self):
+        clients = [
+            {"address": "a", "class": "google-chrome", "title": "Healthchecks.io - Google Chrome"},
+            {"address": "b", "class": "google-chrome", "title": "Healthchecks.io - Google Chrome"},
+        ]
+        r = bare_restorer(clients, sessions_ready=True)
+        saved = [
+            {"title": "Healthchecks.io - Google Chrome", "workspace": 2,
+             "chrome": {"tabs": self.tabs("https://healthchecks.example/a", titles=["Healthchecks.io"])}},
+            {"title": "Healthchecks.io - Google Chrome", "workspace": 3,
+             "chrome": {"tabs": self.tabs("https://healthchecks.example/b", titles=["Healthchecks.io"])}},
+        ]
+        cands = [r._match_client(c) for c in clients]
+        g = {"kind": "browser", "class": "google-chrome", "profile": "Default"}
+        pairs, notes = r._match_group(g, saved, cands, done=False)
+        self.assertEqual(pairs, [])
+        self.assertEqual(len(notes), 2)
+
+    def test_title_fallback_leaves_shared_token_titles_unmoved(self):
+        """Two windows share a distinctive token and neither is an exact unique match."""
+        clients = [
+            {"address": "a", "class": "google-chrome", "title": "Healthchecks.io - Google Chrome"},
+            {"address": "b", "class": "google-chrome", "title": "Healthchecks.io dashboard - Google Chrome"},
+        ]
+        r = bare_restorer(clients, sessions_ready=True)
+        saved = [
+            {"title": "Healthchecks.io checks - Google Chrome", "workspace": 2,
+             "chrome": {"tabs": self.tabs("https://healthchecks.example/checks",
+                                          titles=["Healthchecks.io checks"])}},
+            {"title": "Healthchecks.io status - Google Chrome", "workspace": 3,
+             "chrome": {"tabs": self.tabs("https://healthchecks.example/status",
+                                          titles=["Healthchecks.io status"])}},
+        ]
+        cands = [r._match_client(c) for c in clients]
+        g = {"kind": "browser", "class": "google-chrome", "profile": "Default"}
+        pairs, notes = r._match_group(g, saved, cands, done=False)
+        self.assertEqual(pairs, [])
+        self.assertEqual(len(notes), 2)
+
+    def test_title_fallback_pairs_exact_titles_even_if_they_share_a_token(self):
+        clients = [
+            {"address": "a", "class": "google-chrome", "title": "Healthchecks.io checks - Google Chrome"},
+            {"address": "b", "class": "google-chrome", "title": "Healthchecks.io status - Google Chrome"},
+        ]
+        r = bare_restorer(clients, sessions_ready=True)
+        saved = [
+            {"title": "Healthchecks.io checks - Google Chrome", "workspace": 2,
+             "chrome": {"tabs": self.tabs("https://healthchecks.example/checks",
+                                          titles=["Healthchecks.io checks"])}},
+            {"title": "Healthchecks.io status - Google Chrome", "workspace": 3,
+             "chrome": {"tabs": self.tabs("https://healthchecks.example/status",
+                                          titles=["Healthchecks.io status"])}},
+        ]
+        cands = [r._match_client(c) for c in clients]
+        g = {"kind": "browser", "class": "google-chrome", "profile": "Default"}
+        pairs, notes = r._match_group(g, saved, cands, done=False)
+        got = {(wi, cands[ci]["address"], how) for wi, ci, _s, how in pairs}
+        self.assertEqual(got, {(0, "a", "title"), (1, "b", "title")})
+        self.assertEqual(notes, [])
+
+    def test_title_fallback_does_not_take_a_title_that_also_fits_another_profile(self):
+        clients = [{"address": "w", "class": "google-chrome",
+                    "title": "Project board - Google Chrome"}]
+        other = {"kind": "browser", "class": "google-chrome", "profile": "Default",
+                 "windows": [{"title": "Project board - Google Chrome",
+                              "chrome": {"tabs": self.tabs("https://board.example/",
+                                                           titles=["Project board"])}}]}
+        r = bare_restorer(clients, sess={"items": [other]}, sessions_ready=True)
+        saved = [{"title": "Project board - Google Chrome", "workspace": 3,
+                  "chrome": {"tabs": self.tabs("https://p1-board.example/",
+                                               titles=["Project board"])}}]
+        cands = [r._match_client(c) for c in clients]
+        g = {"kind": "browser", "class": "google-chrome", "profile": "Profile 1"}
+        for done in (False, True):
+            pairs, notes = r._match_group(g, saved, cands, done=done)
+            self.assertEqual(pairs, [])
+            self.assertEqual(len(notes), 1)
+
+    def test_healthchecks_title_still_matches_when_the_down_count_changes(self):
+        self.assertGreaterEqual(
+            m.title_fallback_score(
+                {"title": "2 down – Healthchecks.io - Google Chrome",
+                 "chrome": {"tabs": [{"url": "https://healthchecks.example/", "title": "2 down – Healthchecks.io"}]}},
+                "1 down – Healthchecks.io - Google Chrome"),
+            0.9)
+        self.assertEqual(m.distinctive_title_key("jay - Google Chrome"), "")
+        self.assertEqual(m.distinctive_title_key("New Tab - Google Chrome"), "")
+        self.assertEqual(m.distinctive_title_key("Inbox - Google Chrome"), "")
+        self.assertTrue(m.title_fallback_ready(time.time() - 10, done=False))
+        self.assertFalse(m.title_fallback_ready(None, done=False))
+        self.assertFalse(m.title_fallback_ready(time.time(), done=False))
+        self.assertTrue(m.title_fallback_ready(None, done=True))
 
     def test_tab_listed_window_does_not_take_another_profiles_window_by_title(self):
         clients = [{"address": "other", "class": "google-chrome", "title": "Board - Google Chrome"}]
