@@ -14,7 +14,7 @@ quietly and restores once on the next login.
 | | |
 |---|---|
 | **Plugin id** | `eric.session-restore` |
-| **Version** | 1.4.4 |
+| **Version** | 1.4.5 |
 | **License** | MIT |
 | **Author** | Eric Westphal ([@westphae](https://github.com/westphae)) |
 | **Based on** | [wbarakat/omarchy-session-restore](https://github.com/wbarakat/omarchy-session-restore) (MIT, © 2026 Waleed) |
@@ -525,6 +525,24 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
 ---
 
 ## Recent changes
+
+### 1.4.5
+- Installed web apps (`--app-id` PWAs) and `--app` windows are always
+  launched with their own `--profile-directory`, also for `Default`.
+  Without it, a browser already running another profile opened the app in
+  that profile, where it is not installed, and no window appeared. A web app
+  whose profile is still waiting for its deferred browser launch now starts
+  after that launch, so it cannot open the profile without its session.
+- A second Chrome profile that comes up as a New Tab window no longer
+  gives up on Ctrl+Shift+T after one try because no window could be told
+  apart yet. Restore keeps waiting until the deadline, and a New Tab that
+  first appeared after that profile's own launch is taken as its stand-in
+  right away. Before, that profile's window stayed empty.
+- The title fallback no longer rejects an exact title match because a
+  shared word (for example a domain-like word in a repo path) appears in
+  another profile's tab. Another profile now blocks the match only when it
+  fits at least as well. The reopened window is then paired, and the empty
+  New Tab stand-in is closed as intended.
 
 ### 1.4.4
 - Chrome no longer comes back with "Chrome didn't shut down correctly" and a

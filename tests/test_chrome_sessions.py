@@ -891,5 +891,122 @@ class ShutdownGuardTests(unittest.TestCase):
         g.release()  # idempotent
 
 
+class RestoreGlitchTests(unittest.TestCase):
+    """1.4.5: reopened windows, deferred profiles and web apps."""
+
+    def tabs(self, *urls, titles=None):
+        titles = titles or [""] * len(urls)
+        return [{"url": u, "title": t} for u, t in zip(urls, titles)]
+
+    def test_exact_title_is_not_vetoed_by_a_shared_word_in_another_profile(self):
+        live = "Inbox (12) - me@example-research.org - Example Research Mail - Google Chrome"
+        clients = [{"address": "w", "class": "google-chrome", "title": live}]
+        other = {"kind": "browser", "class": "google-chrome", "profile": "Profile 1",
+                 "windows": [{"title": "notes/research/ideas - repo - Google Chrome",
+                              "chrome": {"tabs": self.tabs("https://git.example/notes",
+                                                           titles=["notes/research/ideas - repo"])}}]}
+        r = bare_restorer(clients, sess={"items": [other]}, sessions_ready=True)
+        saved = [{"title": live, "workspace": 2,
+                  "chrome": {"tabs": self.tabs("https://mail.example/", titles=["Inbox (12)"])}}]
+        cands = [r._match_client(c) for c in clients]
+        g = {"kind": "browser", "class": "google-chrome", "profile": "Profile 2"}
+        pairs, _notes = r._match_group(g, saved, cands, done=True)
+        self.assertEqual([(p[0], p[1], p[3]) for p in pairs], [(0, 0, "title")])
+
+    def test_webapp_argv_always_names_its_profile(self):
+        f = m.webapp_launch_argv
+        app = "chrome-" + "a" * 32 + "-Default"
+        self.assertEqual(f(["/opt/google/chrome/chrome", "--app-id=" + "a" * 32], app),
+                         ["/opt/google/chrome/chrome", "--app-id=" + "a" * 32, "--profile-directory=Default"])
+        self.assertEqual(f(["chromium", "--app=https://x.example/"], "chromium-x.example-Profile_3"),
+                         ["chromium", "--app=https://x.example/", "--profile-directory=Profile 3"])
+        kept = ["google-chrome", "--profile-directory=Profile 1", "--app-id=" + "a" * 32]
+        self.assertEqual(f(kept, app), kept)
+        self.assertEqual(f(["omarchy-launch-webapp", "https://x.example/"], "x"),
+                         ["omarchy-launch-webapp", "https://x.example/"])
+
+    def _webapp_restorer(self, ud):
+        r = bare_restorer([])
+        r.cfg = {"browser_settle_seconds": 4, "app_wait_seconds": 20}
+        r.deferred_webapps = []
+        app = {"kind": "webapp", "class": "chrome-" + "a" * 32 + "-Default",
+               "argv": ["/opt/google/chrome/chrome", f"--user-data-dir={ud}",
+                        "--app-id=" + "a" * 32, "--profile-directory=Default"],
+               "windows": [{"title": "Music", "workspace": 5}]}
+        g = {"kind": "browser", "class": "google-chrome", "profile": "Default", "remaining": [{}],
+             "needs_launch": ["/opt/google/chrome/chrome", f"--user-data-dir={ud}",
+                              "--profile-directory=Default", "--restore-last-session"]}
+        r.pending = [g]
+        return r, app, g
+
+    def test_webapp_waits_until_its_profile_has_been_launched(self):
+        ud = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, ud, True)
+        r, app, g = self._webapp_restorer(ud)
+        launched = []
+        r.launch = lambda argv, ws: launched.append(argv) or True
+        self.assertTrue(r._webapp_waits_for_profile(app))
+        r.deferred_webapps.append(app)
+        r._launch_deferred_webapps()
+        self.assertEqual(launched, [])
+        # Launched just now, no window yet: still wait a moment.
+        g["launched_argv"], g["needs_launch"], g["launched_at"] = g["needs_launch"], None, time.time()
+        self.assertTrue(r._webapp_waits_for_profile(app))
+        g["first_window_at"] = time.time()
+        self.assertFalse(r._webapp_waits_for_profile(app))
+        r._launch_deferred_webapps()
+        self.assertEqual(len(launched), 1)
+        self.assertEqual(r.deferred_webapps, [])
+        self.assertEqual(r.pending[-1]["class"], app["class"])
+
+    def test_webapp_of_another_profile_does_not_wait(self):
+        ud = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, ud, True)
+        r, app, g = self._webapp_restorer(ud)
+        g["profile"] = "Profile 2"
+        self.assertFalse(r._webapp_waits_for_profile(app))
+
+    def test_reopen_without_a_target_waits_instead_of_giving_up(self):
+        r = bare_restorer([])
+        r.cfg = {"browser_settle_seconds": 4}
+        g = {"kind": "browser", "class": "google-chrome", "profile": "Default",
+             "remaining": [{"title": "agenda"}], "windows": [{"title": "agenda"}],
+             "deadline": time.time() + 40}
+        self.assertIsNone(r._reopen_closed_window(g))
+        self.assertFalse(g.get("reopen_stop"))
+        self.assertGreater(g["reopen_after"], time.time())
+        g["deadline"] = time.time() + 1
+        self.assertIs(r._reopen_closed_window(g), False)
+        self.assertTrue(g.get("reopen_stop"))
+
+    def test_new_tab_from_a_deferred_launch_is_that_profiles_stand_in(self):
+        clients = [{"address": "first", "class": "google-chrome", "title": "New Tab - Google Chrome"},
+                   {"address": "later", "class": "google-chrome", "title": "New Tab - Google Chrome"}]
+        r = bare_restorer(clients)
+        now = time.time()
+        starter = {"kind": "browser", "class": "google-chrome", "profile": "Profile 2",
+                   "remaining": [{"title": "Mail", "workspace": 5}], "deadline": now + 60}
+        deferred = {"kind": "browser", "class": "google-chrome", "profile": "Default",
+                    "remaining": [{"title": "agenda", "workspace": 2}], "deadline": now + 60,
+                    "launched_at": now - 5}
+        r.pending = [starter, deferred]
+        r._first_seen = {"first": now - 10, "later": now - 3}
+        cands = [r._match_client(c) for c in clients]
+        self.assertTrue(r._claim_ntp_standin(deferred, cands))
+        self.assertEqual(deferred["reopen_standin"], "later")
+        # One New Tab, two waiting profiles, no launch to tell them apart: wait.
+        one = clients[1:]
+        r2 = bare_restorer(one)
+        d2 = dict(deferred, launched_at=None, reopen_standin=None)
+        r2.pending = [dict(starter), d2]
+        self.assertFalse(r2._claim_ntp_standin(d2, [r2._match_client(c) for c in one]))
+        # Same window, but it appeared after this profile's own launch: claim it.
+        r3 = bare_restorer(one)
+        d3 = dict(deferred, reopen_standin=None)
+        r3.pending = [dict(starter), d3]
+        r3._first_seen = {"later": now - 3}
+        self.assertTrue(r3._claim_ntp_standin(d3, [r3._match_client(c) for c in one]))
+
+
 if __name__ == "__main__":
     unittest.main()

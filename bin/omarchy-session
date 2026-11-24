@@ -46,7 +46,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "1.4.4"
+VERSION = "1.4.5"
 # 2: Chromium windows carry their profile and tab list ("chrome"). 1 still loads.
 FORMAT = 2
 READ_FORMATS = (1, 2)
@@ -1007,6 +1007,33 @@ class DesktopIndex:
 
     def terminals(self):
         return [e for e in self.entries if "TerminalEmulator" in e["cats"]]
+
+
+def webapp_profile(cls):
+    """Chromium profile directory named by a web-app window class, or ''."""
+    m = WEBAPP_CLASS.match(cls or "")
+    return m.group("profile").replace("_", " ") if m else ""
+
+
+def webapp_launch_argv(argv, cls):
+    """Launch argv for a Chromium web app that always names its profile.
+
+    Without --profile-directory a running browser opens the app in whatever
+    profile it last used. If the app is installed only in another profile
+    (an --app-id PWA), nothing opens at all.
+    """
+    argv = list(argv or [])
+    prof = webapp_profile(cls)
+    if not argv or not prof:
+        return argv
+    if any(a.startswith("--profile-directory") for a in argv):
+        return argv
+    b = base(argv[0])
+    if b not in CHROMIUM_USER_DATA and "chrom" not in b and b not in BROWSER_BINS:
+        return argv
+    if any(a.startswith(("--app=", "--app-id=")) for a in argv) or b in CHROMIUM_USER_DATA:
+        return argv + ["--profile-directory=" + prof]
+    return argv
 
 
 def webapp_url_from_argv(argv):
@@ -1983,13 +2010,22 @@ def match_tab_listed_by_title(saved, clients, profile="", other_saved=None):
     others = list(other_saved or [])
     for ci in eligible:
         live_title = clients[ci].get("title")
-        if others and any(title_fallback_score(w, live_title) >= 0.9 for w in others):
-            conflicted.add(ci)
-            continue
+        own = {}
         for wi, w in enumerate(saved):
             s = title_fallback_score(w, live_title)
             if s >= 0.9:
-                scores[(wi, ci)] = s
+                own[wi] = s
+        if not own:
+            continue
+        # Another profile's window that fits at least as well makes this
+        # ambiguous. A shared word ("research") in another profile's tab
+        # must not veto an exact title match in this one.
+        best_own = max(own.values())
+        if others and any(title_fallback_score(w, live_title) >= best_own for w in others):
+            conflicted.add(ci)
+            continue
+        for wi, s in own.items():
+            scores[(wi, ci)] = s
     used_w, used_c, pairs = set(), set(), []
     for (wi, ci), s in sorted(scores.items(), key=lambda kv: -kv[1]):
         if wi in used_w or ci in used_c:
@@ -3433,9 +3469,7 @@ def snapshot(cfg):
                             url = "https://" + host + "/" + path.replace("_", "/").lstrip("/")
                         argv = [chrome_bin, f"--app={url}"]
                         strategy = "browser --app"
-                    prof = m.group("profile")
-                    if prof != "Default":
-                        argv.append("--profile-directory=" + prof.replace("_", " "))
+                argv = webapp_launch_argv(argv, cls)
                 for c in wins:
                     items.append({"kind": "webapp", "class": cls, "argv": argv,
                                   "strategy": strategy, "windows": [window_record(c)]})
@@ -4256,8 +4290,9 @@ def print_plan(sess):
                 if hooked:
                     print("     $ env OMARCHY_SR_QUEUE=<per-restore queue> " + shlex.join(it.get("plain_argv") or it["argv"]))
                     continue
-        print("     $ " + shlex.join(it["argv"]))
-        print("     dispatch: " + exec_dispatch_string(it["argv"], primary_ws(it) if k == "browser" else ws_selector(it["windows"][0]), use_uwsm))
+        argv = webapp_launch_argv(it["argv"], it.get("class")) if k == "webapp" else it["argv"]
+        print("     $ " + shlex.join(argv))
+        print("     dispatch: " + exec_dispatch_string(argv, primary_ws(it) if k == "browser" else ws_selector(it["windows"][0]), use_uwsm))
     if sess.get("skipped"):
         print("\nNot saved: " + ", ".join(f"{s['class']} ({s['reason']})" for s in sess["skipped"]))
 
@@ -4340,6 +4375,7 @@ class Restorer:
         self.hooked = hook_installed()
         self.refocus = None
         self._chrome_sessions_seen_at = None
+        self.deferred_webapps = []   # web apps waiting for their profile's browser launch
         try:
             self.prev_focus = (hypr_json("activewindow") or {}).get("address")
         except Exception:
@@ -4688,8 +4724,38 @@ class Restorer:
             time.sleep(0.25)
         return None
 
+    def _note_first_seen(self):
+        """Remember when each live window was first seen during restore."""
+        seen = getattr(self, "_first_seen", None)
+        if seen is None:
+            self._first_seen = seen = {}
+        now = time.time()
+        for c in self.clients():
+            if c.get("address"):
+                seen.setdefault(c["address"], now)
+        return seen
+
+    def _own_launch_ntps(self, g, ntps):
+        """NTP windows that can only come from this group's deferred launch.
+
+        A profile handed to an already running browser opens one New Tab
+        window. If no other waiting group was launched at or after this one,
+        a New Tab that first appeared after this launch is this profile's.
+        """
+        launched = g.get("launched_at")
+        if not launched:
+            return []
+        for p in self.pending:
+            if p is g or p.get("class") != g.get("class") or not p.get("remaining"):
+                continue
+            if p.get("needs_launch") or (p.get("launched_at") or 0) >= launched:
+                return []
+        seen = getattr(self, "_first_seen", None) or {}
+        return [c for c in ntps if seen.get(c.get("address"), 0) >= launched]
+
     def step_pending(self, final):
         progressed = False
+        self._note_first_seen()
         for g in list(self.pending):
             raw = self.unclaimed(g["class"])
             cands = [self._match_client(c) for c in raw]
@@ -4879,7 +4945,10 @@ class Restorer:
         # windows as waiters — wait until desperate (near deadline) unless
         # there is a spare placeholder.
         done_soon = time.time() + 15 >= g.get("deadline", 0)
-        if others and len(ntps) <= len(others) and not done_soon:
+        own = self._own_launch_ntps(g, ntps) if others else []
+        if len(own) == 1:
+            ntps = own
+        elif others and len(ntps) <= len(others) and not done_soon:
             return False
         c = ntps[0]
         w = g["remaining"][0]
@@ -5023,6 +5092,17 @@ class Restorer:
             return False
         target = self._reopen_target(g)
         if not target:
+            # The profile's New Tab stand-in may not be claimable yet (two
+            # profiles both showing New Tab). Keep waiting until the deadline
+            # instead of giving up on the first try.
+            settle = max(1, int(self.cfg.get("browser_settle_seconds", 4)))
+            if time.time() + settle < g.get("deadline", 0):
+                if not g.get("reopen_wait_logged"):
+                    log(f"restore: reopen waiting class={g.get('class')} profile={g.get('profile') or '-'} "
+                        "(no window of this profile to send the shortcut to yet)")
+                    g["reopen_wait_logged"] = True
+                g["reopen_after"] = time.time() + settle
+                return None
             log(f"restore: reopen skipped class={g.get('class')} profile={g.get('profile') or '-'} "
                 "(no window of this profile to send the shortcut to)")
             g["reopen_stop"] = True
@@ -5109,6 +5189,50 @@ class Restorer:
                 return False
         return True
 
+    def _webapp_waits_for_profile(self, it, now=None):
+        """True while this web app's profile is a browser group not yet up.
+
+        Opening the app first would load that profile without its session,
+        so the later --restore-last-session launch would bring nothing back.
+        """
+        prof = webapp_profile(it.get("class"))
+        argv = it.get("argv") or []
+        if not prof or not argv:
+            return False
+        ud = chromium_user_data(base(argv[0]), "", argv)
+        if not ud:
+            return False
+        now = time.time() if now is None else now
+        settle = max(1, int(self.cfg.get("browser_settle_seconds", 4)))
+        for g in self.pending:
+            if g.get("kind") != "browser" or (g.get("profile") or "") != prof:
+                continue
+            gargv = g.get("needs_launch") or g.get("launched_argv") or []
+            gud = chromium_user_data(base(gargv[0]), "", gargv) if gargv else None
+            if gud and os.path.realpath(gud) != os.path.realpath(ud):
+                continue
+            if g.get("needs_launch"):
+                return True
+            launched = g.get("launched_at")
+            if (launched and g.get("first_window_at") is None
+                    and now < launched + settle):
+                return True
+        return False
+
+    def _launch_deferred_webapps(self, force=False):
+        """Start web apps whose profile's browser launch has gone out."""
+        for it in list(self.deferred_webapps):
+            if not force and self._webapp_waits_for_profile(it):
+                continue
+            self.deferred_webapps.remove(it)
+            cls, wins = it["class"], it["windows"]
+            log(f"restore: launching deferred web app {cls}")
+            if not self.launch(it["argv"], ws_selector(wins[0])):
+                self.failed.append(cls)
+                continue
+            self.pending.append({"class": cls, "remaining": list(wins),
+                                 "deadline": time.time() + self.cfg["app_wait_seconds"]})
+
     def _launch_deferred_profiles(self):
         """Start a second Chrome profile only if its windows have not appeared.
 
@@ -5135,15 +5259,21 @@ class Restorer:
                 log(f"restore: {cls} profile={prof} deferred launch failed")
                 self.failed.append(cls)
             g["needs_launch"] = None
+            g["launched_argv"] = argv
+            g["launched_at"] = time.time()
 
     def wait_pending(self):
         settle = max(1, int(self.cfg.get("browser_settle_seconds", 4)))
         last_addrs = {c.get("address") for c in self.clients()}
         last_change = time.time()
         last_names = None
-        while self.pending:
+        while self.pending or self.deferred_webapps:
+            if not self.pending:
+                self._launch_deferred_webapps(force=True)
+                continue
             self.step_pending(final=False)
             self._launch_deferred_profiles()
+            self._launch_deferred_webapps()
             self._close_profile_pickers()
             if not self.pending:
                 break
@@ -5193,6 +5323,8 @@ class Restorer:
                     if time.time() - group_change < settle:
                         continue
                     opened = self._reopen_closed_window(g)
+                    if opened is None:
+                        continue  # nothing to send it to yet; try again later
                     g["reopen_attempts"] = g.get("reopen_attempts", 0) + 1
                     if opened:
                         last_change = time.time()
@@ -5206,6 +5338,7 @@ class Restorer:
             now = time.time()
             if (now - last_change >= settle
                     and self._pending_can_finish(now)
+                    and not self.deferred_webapps
                     and not any(g.get("needs_launch") for g in self.pending)):
                 self.step_pending(final=True)
                 self._close_profile_pickers(final=True)
@@ -5580,6 +5713,8 @@ class Restorer:
                         "launch_ws": primary_ws(it),
                     })
                     continue
+                if k == "webapp":
+                    it = dict(it, argv=webapp_launch_argv(it.get("argv"), cls))
                 if k in ("app", "webapp"):
                     existing = self.unclaimed(cls, include_known=True)
                     if existing:
@@ -5591,6 +5726,10 @@ class Restorer:
                 ws = ws_selector(wins[0])
                 if k == "terminal":
                     self.run_terminal(it, ws)
+                    continue
+                if k == "webapp" and self._webapp_waits_for_profile(it):
+                    log(f"restore: {cls}: waiting for its Chrome profile to be launched first")
+                    self.deferred_webapps.append(it)
                     continue
                 argv = it["argv"]
                 if not self.launch(argv, ws):
