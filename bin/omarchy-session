@@ -25,6 +25,7 @@
 #     go there. Unmatched titles stay in the mode-600 session log.
 
 import argparse
+import atexit
 import ctypes
 import difflib
 import fcntl
@@ -42,9 +43,10 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
-VERSION = "1.4.3"
+VERSION = "1.4.4"
 # 2: Chromium windows carry their profile and tab list ("chrome"). 1 still loads.
 FORMAT = 2
 READ_FORMATS = (1, 2)
@@ -83,6 +85,7 @@ DEFAULTS = {
     "browser_settle_seconds": 4,  # quiet period before reopening closed browser windows
     "browser_primary_wait_seconds": 15,  # wait for the first Chromium process before launching other profiles
     "restore_chromium_session": True,  # after a clean exit, put back the pre-logout Chrome session
+    "quit_browsers_on_shutdown": True,  # hold a logind delay lock; let Chromium quit cleanly on reboot/poweroff
     "terminal_wait_seconds": 10,
     "app_wait_seconds": 20,
     "skip_classes": [],            # window classes never saved (regexes, full match)
@@ -2695,12 +2698,14 @@ def sess_chromium_profiles(sess):
     return out
 
 
-def quit_chromium_browsers(sess, timeout=10):
+def quit_chromium_browsers(sess, timeout=10, label="save (final)"):
     """SIGTERM Chromium-family browsers and wait for a clean Preferences exit.
 
-    Used only from ``save(--final)`` so reboot/logout does not leave
-    ``exit_type=Crashed``. Does not rewrite session.json. Returns a short
-    status string for the log.
+    Used from ``save(--final)`` and from the shutdown guard (logind
+    PrepareForShutdown) so reboot/logout does not leave ``exit_type=Crashed``.
+    Chromium treats SIGTERM as a session end: every window stays in its
+    session file. Does not rewrite session.json. Returns a short status
+    string for the log.
     """
     targets = sess_chromium_profiles(sess)
     pids = chromium_browser_main_pids()
@@ -2709,11 +2714,11 @@ def quit_chromium_browsers(sess, timeout=10):
     for pid in pids:
         try:
             os.kill(pid, signal.SIGTERM)
-            log(f"save (final): sent SIGTERM to chromium pid={pid}")
+            log(f"{label}: sent SIGTERM to chromium pid={pid}")
         except ProcessLookupError:
             pass
         except OSError as e:
-            log(f"save (final): cannot signal chromium pid={pid}: {e}")
+            log(f"{label}: cannot signal chromium pid={pid}: {e}")
     deadline = time.time() + max(1.0, float(timeout))
     status = "timeout"
     while time.time() < deadline:
@@ -2845,7 +2850,61 @@ def preinstall_chromium_sessions(sess, enabled=True):
             ud, prof, running=False, enabled=enabled)
         log(f"restore: chrome profile {prof} session snapshot: {why}")
         results.append((ud, prof, ok, why))
+        # The session to restore is decided above (Chrome's own file after a
+        # crash). Restore relaunches it with --restore-last-session, so
+        # Chrome's "didn't shut down correctly" Restore bubble would only add
+        # a duplicate window. Clear the flag while no browser is running.
+        flag = mark_chromium_profile_clean(ud, prof)
+        if flag == "cleared":
+            log(f"restore: chrome profile {prof}: cleared the crashed-exit flag "
+                "(no second restore bubble)")
+        elif flag not in ("clean", "missing"):
+            log(f"restore: chrome profile {prof}: crashed-exit flag left as is ({flag})")
     return results
+
+
+def mark_chromium_profile_clean(user_data, profile):
+    """Mark a Chromium profile's last exit as normal in its Preferences.
+
+    Only ``profile.exit_type`` and ``profile.exited_cleanly`` change; the
+    session files are untouched, so no tab is lost. The caller must make sure
+    no browser process is using ``user_data``. Returns 'cleared', 'clean',
+    'missing', 'unreadable' or 'failed'.
+    """
+    if not user_data or not profile or not PROFILE_DIR_RE.match(profile):
+        return "unreadable"
+    path = os.path.join(user_data, profile, "Preferences")
+    try:
+        st = os.stat(path)
+        with open(path, "rb") as f:
+            prefs = json.loads(f.read().decode("utf-8"))
+    except FileNotFoundError:
+        return "missing"
+    except (OSError, ValueError):
+        return "unreadable"
+    prof = prefs.get("profile") if isinstance(prefs, dict) else None
+    if not isinstance(prof, dict):
+        return "unreadable"
+    if prof.get("exit_type") != "Crashed" and prof.get("exited_cleanly") is not False:
+        return "clean"
+    prof["exit_type"] = "Normal"
+    prof["exited_cleanly"] = True
+    data = json.dumps(prefs, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".Preferences.sr.")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, st.st_mode & 0o777)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return "failed"
+    return "cleared"
 
 
 def chromium_profile_is_running(user_data, profile):
@@ -5726,6 +5785,152 @@ def restore(args):
 
 
 # ----------------------------------------------------------------- daemon --
+_PFS_RE = re.compile(r"\.PrepareForShutdown \((true|false)\b")
+
+
+def prepare_for_shutdown_state(line):
+    """True/False for a `gdbus monitor` PrepareForShutdown line, else None."""
+    m = _PFS_RE.search(line or "")
+    if not m:
+        return None
+    return m.group(1) == "true"
+
+
+def inhibit_delay_seconds(default=5.0):
+    """logind's InhibitDelayMaxSec (how long a delay lock may hold shutdown)."""
+    rc, out = run(["busctl", "get-property", "org.freedesktop.login1",
+                   "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
+                   "InhibitDelayMaxUSec"], timeout=3)
+    m = re.match(r"\s*t\s+(\d+)", out or "")
+    if rc != 0 or not m:
+        return default
+    return int(m.group(1)) / 1e6
+
+
+def shutdown_quit_timeout(delay):
+    """Browser quit budget inside logind's delay, leaving a margin."""
+    return max(1.0, min(10.0, float(delay) - 1.5))
+
+
+class ShutdownGuard(threading.Thread):
+    """Let Chromium browsers quit cleanly on any reboot or poweroff.
+
+    Holds a logind *delay* lock (``systemd-inhibit --mode=delay``) and watches
+    for PrepareForShutdown. That covers every way a reboot starts (menu,
+    `omarchy update`'s reboot prompt, `systemctl reboot`), not only the menu
+    rows that run ``save --final``. On the signal it sends Chromium SIGTERM,
+    waits until the profiles record a clean exit (bounded by logind's delay),
+    then drops the lock. Runs in its own thread so a long restore or save
+    never holds up the shutdown.
+    """
+
+    def __init__(self):
+        super().__init__(name="shutdown-guard", daemon=True)
+        self.inhibit = None
+        self.monitor = None
+        self.stopping = False
+        self.lock = threading.Lock()
+
+    def available(self):
+        return bool(shutil.which("gdbus") and shutil.which("systemd-inhibit"))
+
+    def take(self):
+        with self.lock:
+            if self.inhibit and self.inhibit.poll() is None:
+                return
+            try:
+                # `cat` exits when our end of its stdin closes (release, or
+                # this daemon dies), and systemd-inhibit then drops the lock.
+                self.inhibit = subprocess.Popen(
+                    ["systemd-inhibit", "--what=shutdown", "--mode=delay",
+                     "--who=Session Restore",
+                     "--why=Let browsers save their session before shutdown", "cat"],
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+            except OSError as e:
+                self.inhibit = None
+                log(f"shutdown guard: cannot take delay lock: {e}")
+
+    def release(self):
+        with self.lock:
+            p, self.inhibit = self.inhibit, None
+        if not p:
+            return
+        try:
+            p.stdin.close()
+        except OSError:
+            pass
+        try:
+            p.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            p.terminate()
+
+    def stop(self):
+        self.stopping = True
+        self.release()
+        m = self.monitor
+        if m and m.poll() is None:
+            m.terminate()
+
+    def on_shutdown(self):
+        try:
+            cfg = load_config()
+            if not (cfg["enabled"] and cfg.get("quit_browsers_on_shutdown", True)):
+                return
+            try:
+                with open(SESSION) as f:
+                    sess = json.load(f)
+            except (OSError, ValueError):
+                sess = {}
+            if not isinstance(sess, dict):
+                sess = {}
+            status = quit_chromium_browsers(
+                sess, timeout=shutdown_quit_timeout(inhibit_delay_seconds()),
+                label="shutdown guard")
+            log(f"shutdown guard: chromium graceful quit: {status}")
+        except Exception as e:
+            log(f"shutdown guard: {e!r}")
+        finally:
+            self.release()
+
+    def run(self):
+        while True:
+            self.take()
+            try:
+                self.monitor = subprocess.Popen(
+                    ["gdbus", "monitor", "--system", "--dest", "org.freedesktop.login1",
+                     "--object-path", "/org/freedesktop/login1"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL)
+            except OSError as e:
+                log(f"shutdown guard: cannot watch logind: {e}")
+                self.release()
+                return
+            for raw in self.monitor.stdout:
+                state = prepare_for_shutdown_state(raw.decode("utf-8", "replace"))
+                if state is True:
+                    log("shutdown guard: system is shutting down")
+                    self.on_shutdown()
+                elif state is False:
+                    self.take()  # shutdown cancelled; hold the lock again
+            self.monitor.wait()
+            # Without a watcher the lock would only delay shutdown.
+            self.release()
+            if self.stopping:
+                return
+            log("shutdown guard: logind watcher exited; retrying in 30s")
+            time.sleep(30)
+
+
+def start_shutdown_guard():
+    g = ShutdownGuard()
+    if not g.available():
+        log("shutdown guard: gdbus or systemd-inhibit missing; not started")
+        return None
+    g.start()
+    return g
+
+
 def set_pdeathsig():
     try:
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -5758,6 +5963,9 @@ def daemon(args):
     lk.write(str(os.getpid()))
     lk.flush()
     log(f"daemon: started (pid {os.getpid()}, v{VERSION})")
+    guard = start_shutdown_guard()
+    if guard:
+        atexit.register(guard.stop)
     cfg = load_config()
     if cfg["enabled"]:
         try:

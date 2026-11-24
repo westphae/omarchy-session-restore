@@ -14,7 +14,7 @@ quietly and restores once on the next login.
 | | |
 |---|---|
 | **Plugin id** | `eric.session-restore` |
-| **Version** | 1.4.3 |
+| **Version** | 1.4.4 |
 | **License** | MIT |
 | **Author** | Eric Westphal ([@westphae](https://github.com/westphae)) |
 | **Based on** | [wbarakat/omarchy-session-restore](https://github.com/wbarakat/omarchy-session-restore) (MIT, © 2026 Waleed) |
@@ -459,6 +459,7 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
   "browser_settle_seconds": 12,
   "browser_primary_wait_seconds": 15,
   "restore_chromium_session": true,
+  "quit_browsers_on_shutdown": true,
   "skip_classes": ["org.pulseaudio.pavucontrol"],
   "resume_commands": ["herdr", "tmux", "zellij", "nvim", "btop", "lazygit", "yazi"],
   "notify": true,
@@ -479,6 +480,7 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
 | `browser_settle_seconds` | `12` | Quiet period with no new windows before reopening a missing Chrome window |
 | `browser_primary_wait_seconds` | `15` | When several profiles of one Chromium browser are restored, wait up to this long for the first profile's browser process before launching the others |
 | `restore_chromium_session` | `true` | After a clean Chrome exit, restore the pre-logout session snapshot so every window comes back |
+| `quit_browsers_on_shutdown` | `true` | Hold a logind delay lock and, when any reboot or poweroff starts, ask Chromium-family browsers to quit cleanly (bounded by logind's `InhibitDelayMaxSec`) |
 | `skip_classes` | `[]` | Window classes never saved (full-match regexes) |
 | `resume_commands` | *(built-in TUI list)* | Foreground programs to relaunch in terminals |
 | `notify` | `true` | Desktop notifications on restore |
@@ -516,10 +518,32 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
   on the original command line.
 * A hard power-off still restores the last autosave (≤ 60 s old). Logging out
   via `uwsm stop` / a keybinding instead of the menu skips the final snapshot.
+  Reboot and poweroff from anywhere (menu, `omarchy update`'s reboot prompt,
+  `systemctl reboot`) still let Chromium quit cleanly through the shutdown
+  guard; a plain logout does not, since logind is not involved.
 
 ---
 
 ## Recent changes
+
+### 1.4.4
+- Chrome no longer comes back with "Chrome didn't shut down correctly" and a
+  Restore button that duplicates the restored window. The reboot prompt at
+  the end of `omarchy update` calls `omarchy-system reboot` directly, so the
+  menu rows' `save --final` (which asks Chrome to quit) never ran. Omarchy
+  then closes windows for at most 2 seconds before rebooting, which a large
+  Chrome does not finish, and a profile was left marked as crashed.
+- Shutdown guard: the daemon holds a logind delay lock. When any reboot or
+  poweroff starts, it sends Chromium-family browsers SIGTERM (Chrome treats
+  that as a session end and keeps every window), waits until each profile
+  records a clean exit, then releases the lock. It runs in its own thread
+  and is bounded by logind's `InhibitDelayMaxSec`. Turn it off with
+  `quit_browsers_on_shutdown`.
+- Safety net at restore: after the session to restore has been chosen, and
+  only while no browser is running for that user-data directory, a profile
+  still marked as crashed is set back to a normal exit in its `Preferences`
+  (`exit_type`, `exited_cleanly`; nothing else). Restore already reopens
+  those windows, so Chrome's own restore bubble could only add duplicates.
 
 ### 1.4.3
 - Title fallback for a Chrome window missing from the session files no

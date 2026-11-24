@@ -741,5 +741,155 @@ class SessionFormatTests(unittest.TestCase):
         self.assertFalse(hasattr(m, "_chromium_session_titles"))
 
 
+class CrashedExitFlagTests(unittest.TestCase):
+    """Chrome's "didn't shut down correctly" flag around restore and shutdown."""
+
+    def setUp(self):
+        self.ud = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.ud, True)
+
+    def prefs(self, profile="Default", **prof):
+        d = os.path.join(self.ud, profile)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "Preferences")
+        data = {"profile": dict({"name": "Person 1"}, **prof),
+                "browser": {"window_placement": {"left": 10}}, "title": "caf\u00e9"}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.chmod(path, 0o600)
+        return path
+
+    def read(self, path):
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_crashed_profile_is_marked_normal_and_nothing_else_changes(self):
+        path = self.prefs(exit_type="Crashed", exited_cleanly=False)
+        self.assertEqual(m.mark_chromium_profile_clean(self.ud, "Default"), "cleared")
+        d = self.read(path)
+        self.assertEqual(d["profile"]["exit_type"], "Normal")
+        self.assertIs(d["profile"]["exited_cleanly"], True)
+        self.assertEqual(d["profile"]["name"], "Person 1")
+        self.assertEqual(d["browser"], {"window_placement": {"left": 10}})
+        self.assertEqual(d["title"], "caf\u00e9")
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertEqual(m.chromium_exit_kind(self.ud, "Default"), "normal")
+        self.assertEqual([n for n in os.listdir(os.path.dirname(path)) if n != "Preferences"], [])
+
+    def test_clean_exits_are_left_byte_for_byte(self):
+        for kind in ("Normal", "SessionEnded"):
+            path = self.prefs(exit_type=kind, exited_cleanly=True)
+            with open(path, "rb") as f:
+                before = f.read()
+            self.assertEqual(m.mark_chromium_profile_clean(self.ud, "Default"), "clean")
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), before)
+
+    def test_missing_unreadable_and_odd_profile_names(self):
+        self.assertEqual(m.mark_chromium_profile_clean(self.ud, "Profile 3"), "missing")
+        os.makedirs(os.path.join(self.ud, "Default"))
+        with open(os.path.join(self.ud, "Default", "Preferences"), "w") as f:
+            f.write("{not json")
+        self.assertEqual(m.mark_chromium_profile_clean(self.ud, "Default"), "unreadable")
+        self.assertEqual(m.mark_chromium_profile_clean(self.ud, "../etc"), "unreadable")
+
+    def _sess(self, *profiles):
+        argv = ["/opt/google/chrome/chrome", f"--user-data-dir={self.ud}"]
+        return {"items": [{"kind": "browser", "class": "google-chrome", "profile": p,
+                           "argv": argv + [f"--profile-directory={p}"], "windows": []}
+                          for p in profiles]}
+
+    def test_restore_clears_the_flag_after_choosing_chromes_own_crash_file(self):
+        p1 = self.prefs("Default", exit_type="SessionEnded", exited_cleanly=True)
+        p2 = self.prefs("Profile 1", exit_type="Crashed", exited_cleanly=False)
+        orig = m.chromium_user_data_running
+        m.chromium_user_data_running = lambda ud: False
+        try:
+            res = m.preinstall_chromium_sessions(self._sess("Default", "Profile 1"))
+        finally:
+            m.chromium_user_data_running = orig
+        whys = {prof: why for _ud, prof, _ok, why in res}
+        # Crash file is still what gets restored (decided before the flag is cleared).
+        self.assertEqual(whys["Profile 1"], "crashed-exit")
+        self.assertEqual(self.read(p2)["profile"]["exit_type"], "Normal")
+        self.assertEqual(self.read(p1)["profile"]["exit_type"], "SessionEnded")
+
+    def test_restore_never_touches_preferences_under_a_running_browser(self):
+        p = self.prefs("Default", exit_type="Crashed", exited_cleanly=False)
+        orig = m.chromium_user_data_running
+        m.chromium_user_data_running = lambda ud: True
+        try:
+            m.preinstall_chromium_sessions(self._sess("Default"))
+        finally:
+            m.chromium_user_data_running = orig
+        self.assertEqual(self.read(p)["profile"]["exit_type"], "Crashed")
+
+
+class ShutdownGuardTests(unittest.TestCase):
+    def test_prepare_for_shutdown_lines(self):
+        f = m.prepare_for_shutdown_state
+        self.assertIs(f("/org/freedesktop/login1: org.freedesktop.login1.Manager.PrepareForShutdown (true,)"), True)
+        self.assertIs(f("/org/freedesktop/login1: org.freedesktop.login1.Manager.PrepareForShutdown (false,)"), False)
+        # The metadata twin is sent alongside; act on one signal only.
+        self.assertIsNone(f("/org/freedesktop/login1: org.freedesktop.login1.Manager."
+                            "PrepareForShutdownWithMetadata (true, {'type': <'reboot'>})"))
+        self.assertIsNone(f("/org/freedesktop/login1: org.freedesktop.login1.Manager.PrepareForSleep (true,)"))
+        self.assertIsNone(f("/org/freedesktop/login1: org.freedesktop.login1.Manager.SessionNew ('3', objectpath '/x')"))
+
+    def test_quit_budget_stays_inside_logind_delay(self):
+        self.assertEqual(m.shutdown_quit_timeout(5), 3.5)
+        self.assertEqual(m.shutdown_quit_timeout(15), 10.0)
+        self.assertEqual(m.shutdown_quit_timeout(0.5), 1.0)
+
+    def test_on_shutdown_quits_browsers_and_always_releases(self):
+        g = m.ShutdownGuard()
+        calls, released = [], []
+        g.release = lambda: released.append(True)
+        orig = (m.quit_chromium_browsers, m.inhibit_delay_seconds, m.load_config)
+        m.inhibit_delay_seconds = lambda default=5.0: 5.0
+        m.load_config = lambda: dict(m.DEFAULTS)
+        try:
+            m.quit_chromium_browsers = lambda sess, timeout=10, label="": calls.append((timeout, label)) or "exited"
+            g.on_shutdown()
+            self.assertEqual(calls, [(3.5, "shutdown guard")])
+            self.assertEqual(released, [True])
+
+            def boom(*a, **k):
+                raise RuntimeError("x")
+            m.quit_chromium_browsers = boom
+            g.on_shutdown()
+            self.assertEqual(released, [True, True])
+
+            calls.clear()
+            m.quit_chromium_browsers = lambda sess, timeout=10, label="": calls.append(1) or "exited"
+            m.load_config = lambda: dict(m.DEFAULTS, quit_browsers_on_shutdown=False)
+            g.on_shutdown()
+            self.assertEqual(calls, [])
+            self.assertEqual(released, [True, True, True])
+        finally:
+            m.quit_chromium_browsers, m.inhibit_delay_seconds, m.load_config = orig
+
+    def test_release_closes_the_lock_holder(self):
+        g = m.ShutdownGuard()
+
+        class P:
+            def __init__(self):
+                self.stdin = self
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+            def wait(self, timeout=None):
+                return 0
+
+        p = P()
+        g.inhibit = p
+        g.release()
+        self.assertTrue(p.closed)
+        self.assertIsNone(g.inhibit)
+        g.release()  # idempotent
+
+
 if __name__ == "__main__":
     unittest.main()
