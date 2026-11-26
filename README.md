@@ -14,7 +14,7 @@ quietly and restores once on the next login.
 | | |
 |---|---|
 | **Plugin id** | `eric.session-restore` |
-| **Version** | 1.4.5 |
+| **Version** | 1.4.6 |
 | **License** | MIT |
 | **Author** | Eric Westphal ([@westphae](https://github.com/westphae)) |
 | **Based on** | [wbarakat/omarchy-session-restore](https://github.com/wbarakat/omarchy-session-restore) (MIT, © 2026 Waleed) |
@@ -459,6 +459,7 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
   "browser_settle_seconds": 12,
   "browser_primary_wait_seconds": 15,
   "restore_chromium_session": true,
+  "preserve_crashed": true,
   "quit_browsers_on_shutdown": true,
   "skip_classes": ["org.pulseaudio.pavucontrol"],
   "resume_commands": ["herdr", "tmux", "zellij", "nvim", "btop", "lazygit", "yazi"],
@@ -480,6 +481,7 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
 | `browser_settle_seconds` | `12` | Quiet period with no new windows before reopening a missing Chrome window |
 | `browser_primary_wait_seconds` | `15` | When several profiles of one Chromium browser are restored, wait up to this long for the first profile's browser process before launching the others |
 | `restore_chromium_session` | `true` | After a clean Chrome exit, restore the pre-logout session snapshot so every window comes back |
+| `preserve_crashed` | `true` | If an app crashes (fatal signal, coredump, or a non-zero exit) and its windows disappear, keep those windows in the saved session until the app is opened again or you close it normally |
 | `quit_browsers_on_shutdown` | `true` | Hold a logind delay lock and, when any reboot or poweroff starts, ask Chromium-family browsers to quit cleanly (bounded by logind's `InhibitDelayMaxSec`) |
 | `skip_classes` | `[]` | Window classes never saved (full-match regexes) |
 | `resume_commands` | *(built-in TUI list)* | Foreground programs to relaunch in terminals |
@@ -525,6 +527,21 @@ Log: `~/.local/state/omarchy/session-restore/session-restore.log`
 ---
 
 ## Recent changes
+
+### 1.4.6
+- If an app crashes and its windows disappear, those windows stay in the
+  saved session until the app is opened again or you close it normally.
+  A close while the process is still running, or a clean exit (including
+  SIGTERM, which the shutdown guard uses), still drops them.
+- The earlier Chrome-only guard refused a whole save when every Chrome
+  window vanished, which is why a mid-session Chrome crash was already
+  restored after a reboot. That keep is now per-app, so a crash no longer
+  blocks later changes to the rest of the desk from being saved. The
+  plugin treats a window as crashed when its process is already gone at
+  the moment the window disappears (SIGKILL, oom, or a fatal signal). A
+  close while the process is still running, then a normal exit, is left
+  out of the session. Chromium's `exit_type=Crashed` covers a crash even
+  when the process was not yet being watched.
 
 ### 1.4.5
 - Installed web apps (`--app-id` PWAs) and `--app` windows are always

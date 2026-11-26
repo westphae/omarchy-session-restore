@@ -46,7 +46,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "1.4.5"
+VERSION = "1.4.6"
 # 2: Chromium windows carry their profile and tab list ("chrome"). 1 still loads.
 FORMAT = 2
 READ_FORMATS = (1, 2)
@@ -85,6 +85,7 @@ DEFAULTS = {
     "browser_settle_seconds": 4,  # quiet period before reopening closed browser windows
     "browser_primary_wait_seconds": 15,  # wait for the first Chromium process before launching other profiles
     "restore_chromium_session": True,  # after a clean exit, put back the pre-logout Chrome session
+    "preserve_crashed": True,  # keep an app's windows in the session if it crashed instead of being closed
     "quit_browsers_on_shutdown": True,  # hold a logind delay lock; let Chromium quit cleanly on reboot/poweroff
     "terminal_wait_seconds": 10,
     "app_wait_seconds": 20,
@@ -3356,7 +3357,7 @@ def window_record(c):
     except ValueError:
         sid = 0
     grouped = c.get("grouped") or []
-    return {
+    rec = {
         "title": c.get("title", ""),
         # initialTitle is the name Hyprland saw when the window was created.
         # xdgTag is the app's own stable name (xdg-toplevel-tag), when it sets one.
@@ -3376,6 +3377,13 @@ def window_record(c):
         "size": c.get("size"),
         "stable": sid,
     }
+    try:
+        pid = int(c.get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if pid > 1:
+        rec["pid"] = pid
+    return rec
 
 
 def snapshot(cfg):
@@ -3759,6 +3767,403 @@ def would_lose_chrome_session(old, new):
     return False
 
 
+
+# Signals that mean the process did not quit at the user's request.
+# SIGTERM / SIGINT / SIGHUP are a clean ask to exit (and our shutdown
+# guard uses SIGTERM).
+_FATAL_SIGNALS = {
+    signal.SIGQUIT, signal.SIGILL, signal.SIGTRAP, signal.SIGABRT,
+    signal.SIGBUS, signal.SIGFPE, signal.SIGKILL, signal.SIGSEGV,
+}
+for _name in ("SIGSYS", "SIGSTKFLT", "SIGXCPU", "SIGXFSZ"):
+    _sig = getattr(signal, _name, None)
+    if isinstance(_sig, int):
+        _FATAL_SIGNALS.add(_sig)
+
+# pid -> pidfd, kept so we can waitid() after the process is reaped
+# (only works when we are the parent; otherwise we fall back below).
+_PIDFDS = {}
+# pid -> {"kind": "crash"|"clean", "detail": str, "at": epoch}
+_DEATHS = {}
+_DEATHS_LOADED = False
+# address -> pid from the last live client scan
+_CLIENT_PIDS = {}
+# pids whose window was closed while the process was still running
+_CLOSED_ALIVE = set()
+
+
+def _deaths_path():
+    return os.path.join(STATE_DIR, "process-deaths.json")
+
+
+def _signal_name(n):
+    try:
+        return signal.Signals(int(n)).name
+    except (ValueError, TypeError):
+        return f"signal {n}"
+
+
+def _load_deaths():
+    global _DEATHS_LOADED
+    if _DEATHS_LOADED:
+        return
+    _DEATHS_LOADED = True
+    try:
+        with open(_deaths_path()) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return
+    now = time.time()
+    for key, rec in (data if isinstance(data, dict) else {}).items():
+        try:
+            pid = int(key)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(rec, dict) or rec.get("kind") not in ("crash", "clean"):
+            continue
+        at = rec.get("at") or 0
+        if now - at > 6 * 3600:
+            continue
+        _DEATHS.setdefault(pid, rec)
+
+
+def _save_deaths():
+    now = time.time()
+    data = {str(pid): rec for pid, rec in _DEATHS.items()
+            if now - (rec.get("at") or 0) <= 6 * 3600}
+    try:
+        ensure_dirs()
+        atomic_write(_deaths_path(), json.dumps(data) + "\n", 0o600)
+    except OSError:
+        pass
+
+
+def _interpret_waitid(info):
+    """Turn a waitid result into a death record."""
+    code, status = info.si_code, info.si_status
+    at = time.time()
+    if code == os.CLD_DUMPED:
+        return {"kind": "crash", "detail": f"dumped {_signal_name(status)}", "at": at}
+    if code == os.CLD_KILLED:
+        if status in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            return {"kind": "clean", "detail": f"killed {_signal_name(status)}", "at": at}
+        return {"kind": "crash", "detail": f"killed {_signal_name(status)}", "at": at}
+    if code == os.CLD_EXITED:
+        if status == 0:
+            return {"kind": "clean", "detail": "exited 0", "at": at}
+        return {"kind": "crash", "detail": f"exited {status}", "at": at}
+    return {"kind": "clean", "detail": f"waitid code={code} status={status}", "at": at}
+
+
+def track_pid(pid):
+    """Open a pidfd so we can still read the exit status after the process dies."""
+    pid = int(pid or 0)
+    if pid <= 1 or pid in _PIDFDS or pid in _DEATHS:
+        return
+    try:
+        _PIDFDS[pid] = os.pidfd_open(pid)
+    except OSError:
+        pass
+
+
+def harvest_pid(pid):
+    """Return a death record if this pid has exited, else None (still running)."""
+    _load_deaths()
+    pid = int(pid or 0)
+    if pid <= 1:
+        return None
+    if pid in _DEATHS:
+        return _DEATHS[pid]
+    fd = _PIDFDS.get(pid)
+    if fd is None:
+        if os.path.exists(f"/proc/{pid}"):
+            track_pid(pid)
+            return None
+        rec = _journal_death(pid)
+        if rec:
+            return _record_death(pid, rec)
+        if pid in _CLOSED_ALIVE:
+            return _record_death(pid, {"kind": "clean",
+                                       "detail": "windows closed then process exited",
+                                       "at": time.time()})
+        return rec
+    try:
+        info = os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG)
+    except OSError:
+        info = None
+    if info is None:
+        if os.path.exists(f"/proc/{pid}"):
+            return None
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        _PIDFDS.pop(pid, None)
+        rec = _journal_death(pid)
+        if rec:
+            return _record_death(pid, rec)
+        if pid in _CLOSED_ALIVE:
+            return _record_death(pid, {"kind": "clean",
+                                       "detail": "windows closed then process exited",
+                                       "at": time.time()})
+        return rec
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    _PIDFDS.pop(pid, None)
+    rec = _interpret_waitid(info)
+    _DEATHS[pid] = rec
+    _save_deaths()
+    return rec
+
+
+def _record_death(pid, rec):
+    if not rec:
+        return rec
+    _DEATHS[pid] = rec
+    _save_deaths()
+    return rec
+
+
+def note_closed_address(addr):
+    """Record how a window disappeared, from a Hyprland closewindow event.
+
+    If the process is still running, this was a user close. If the process
+    is already gone, it died first (crash, SIGKILL, oom).
+    """
+    if not addr:
+        return
+    addr = addr.strip()
+    pid = _CLIENT_PIDS.get(addr)
+    if pid is None and not addr.startswith("0x"):
+        pid = _CLIENT_PIDS.get("0x" + addr)
+    if not pid:
+        return
+    _note_vanished_window(addr, pid)
+
+
+def _note_vanished_window(addr, pid):
+    if os.path.exists(f"/proc/{pid}"):
+        _CLOSED_ALIVE.add(pid)
+        return
+    if pid in _DEATHS:
+        return
+    rec = harvest_pid(pid)
+    if rec:
+        return
+    if pid in _CLOSED_ALIVE:
+        _record_death(pid, {"kind": "clean", "detail": "windows closed then process exited",
+                             "at": time.time()})
+        return
+    _record_death(pid, {"kind": "crash",
+                        "detail": "process died before its windows closed",
+                        "at": time.time()})
+
+
+def track_live_client_pids(clients=None):
+    """Refresh the live window map and record how missing ones disappeared.
+
+    If a window's process is already gone when the window disappears, the
+    process died first (crash, SIGKILL, oom). If the process is still
+    running, the user closed the window.
+    """
+    global _CLIENT_PIDS
+    if clients is None:
+        try:
+            clients = hypr_json("clients")
+        except Exception:
+            clients = []
+    now = {}
+    live_pids = set()
+    for c in clients or []:
+        addr = c.get("address") or ""
+        try:
+            pid = int(c.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if addr and pid > 1:
+            now[addr] = pid
+            live_pids.add(pid)
+            track_pid(pid)
+    for addr, pid in list(_CLIENT_PIDS.items()):
+        if addr not in now:
+            _note_vanished_window(addr, pid)
+    for pid in list(_PIDFDS):
+        if pid not in live_pids:
+            harvest_pid(pid)
+    for pid in list(_CLOSED_ALIVE):
+        if pid not in live_pids:
+            harvest_pid(pid)
+    _CLIENT_PIDS = now
+
+
+def _journal_death(pid):
+    """Best-effort crash evidence from coredumpctl or the journal for a reaped pid."""
+    rec = _coredumpctl_death(pid)
+    if rec:
+        return rec
+    return _journalctl_death(pid)
+
+
+def _coredumpctl_death(pid):
+    if not shutil.which("coredumpctl"):
+        return None
+    since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 6 * 3600))
+    rc, out = run(["coredumpctl", "list", "--no-legend", "--no-pager",
+                   f"--since={since}", str(pid)], timeout=4)
+    if rc != 0 or not (out or "").strip():
+        return None
+    # TIME PID UID GID SIG COREFILE EXE
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        try:
+            got, sig = int(parts[1]), int(parts[4])
+        except ValueError:
+            continue
+        if got != pid:
+            continue
+        return {"kind": "crash", "detail": f"dumped {_signal_name(sig)}", "at": time.time()}
+    return None
+
+
+def _journalctl_death(pid):
+    if not shutil.which("journalctl"):
+        return None
+    since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 6 * 3600))
+    rc, out = run(["journalctl", "-b", "--no-pager", "-o", "cat", f"--since={since}",
+                   "--grep", rf"(pid[= ]{pid}\b|\[{pid}\].*(segfault|dumped core)|dumped core.*pid {pid}\b|"
+                   rf"Main process exited.*status=[0-9]+/(KILL|SEGV|ABRT|TRAP|BUS|ILL|FPE|SYS))",
+                   ], timeout=4)
+    if rc != 0 or not (out or "").strip():
+        return None
+    low = out.lower()
+    if "dumped core" in low or "segfault" in low or "core-dump" in low:
+        return {"kind": "crash", "detail": "journal coredump", "at": time.time()}
+    if "oom-kill" in low or "systemd-oomd killed" in low:
+        return {"kind": "crash", "detail": "journal oom-kill", "at": time.time()}
+    for name, sig in (("KILL", signal.SIGKILL), ("SEGV", signal.SIGSEGV),
+                      ("ABRT", signal.SIGABRT), ("TRAP", signal.SIGTRAP),
+                      ("BUS", signal.SIGBUS), ("ILL", signal.SIGILL)):
+        if f"/{name}" in out or f"signal {sig}" in low:
+            return {"kind": "crash", "detail": f"journal {_signal_name(sig)}", "at": time.time()}
+    return None
+
+
+def item_pids(it):
+    out = []
+    for w in it.get("windows") or []:
+        try:
+            pid = int(w.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid > 1 and pid not in out:
+            out.append(pid)
+    return out
+
+
+def item_identity(it):
+    """Identity used to tell a vanished item from a relaunched one."""
+    kind, cls = it.get("kind") or "", it.get("class") or ""
+    if kind == "browser":
+        return ("browser", cls, it.get("profile") or "")
+    if kind == "webapp":
+        return ("webapp", cls)
+    stables = tuple(w.get("stable") for w in (it.get("windows") or []) if w.get("stable"))
+    return (kind, cls, stables or tuple(it.get("argv") or []))
+
+
+def app_was_relaunched(it, new_sess):
+    """True when this app is open again, so the live windows replace the old ones."""
+    kind, cls = it.get("kind") or "", it.get("class") or ""
+    if kind in ("browser", "webapp"):
+        for nit in new_sess.get("items") or []:
+            if (nit.get("kind") in ("browser", "webapp") and (nit.get("class") or "") == cls):
+                return True
+        return False
+    ident = item_identity(it)
+    return any(item_identity(nit) == ident for nit in new_sess.get("items") or [])
+
+
+def _chromium_item_exit_kind(it):
+    if it.get("kind") not in ("browser", "webapp"):
+        return None
+    argv = it.get("argv") or []
+    if not argv:
+        return None
+    ud = chromium_user_data(base(argv[0]), "", argv, class_hint=it.get("class") or "")
+    if not ud:
+        return None
+    prof = it.get("profile") or ""
+    if not prof and it.get("kind") == "webapp":
+        prof = webapp_profile(it.get("class") or "") or "Default"
+    if not prof:
+        return None
+    return chromium_exit_kind(ud, prof)
+
+
+def vanished_abnormally(it):
+    """Why this item's windows should be kept, or None if they were closed normally.
+
+    Evidence, in order: a pidfd wait (covers SIGKILL with no coredump), a
+    recorded death, a coredump or journal line, or Chromium's exit_type.
+    A still-running process means the user closed the windows.
+    """
+    pids = item_pids(it)
+    recs = [harvest_pid(pid) for pid in pids]
+    if any(os.path.exists(f"/proc/{pid}") for pid in pids):
+        return None
+    for rec in recs:
+        if rec and rec.get("kind") == "crash":
+            return rec.get("detail") or "crashed"
+    if pids and recs and all(rec and rec.get("kind") == "clean" for rec in recs):
+        return None
+    kind = _chromium_item_exit_kind(it)
+    if kind == "crashed":
+        return "profile exit_type=Crashed"
+    if kind in ("normal", "ended"):
+        return None
+    for rec in recs:
+        if rec and rec.get("kind") == "crash":
+            return rec.get("detail") or "crashed"
+    return None
+
+
+def merge_preserved_items(old, new, enabled=True):
+    """Copy crashed apps' last-known windows into the new snapshot.
+
+    Deliberate closes (windows closed while the process lives, or a clean
+    exit) are not copied. A relaunched app keeps only its live windows.
+    Returns (sess, notes).
+    """
+    if not enabled or not old or not new:
+        return new, []
+    live = {item_identity(it) for it in new.get("items") or []}
+    added, notes = [], []
+    for it in old.get("items") or []:
+        if not isinstance(it, dict) or not it.get("windows"):
+            continue
+        if item_identity(it) in live or app_was_relaunched(it, new):
+            continue
+        reason = vanished_abnormally(it)
+        if not reason:
+            continue
+        kept = dict(it)
+        kept["preserved_from"] = "crash"
+        added.append(kept)
+        n = len(it.get("windows") or [])
+        cls = it.get("class") or "?"
+        prof = it.get("profile") or ""
+        who = f"{cls} profile={prof}" if prof else cls
+        log(f"save: preserved {n} {who} window(s) after crash ({reason})")
+        notes.append(f"{who} ({reason})")
+    if added:
+        new = dict(new, items=list(new.get("items") or []) + added)
+    return new, notes
+
+
 def save(final=False, reason="manual"):
     cfg = load_config()
     if not cfg["enabled"]:
@@ -3776,16 +4181,24 @@ def save(final=False, reason="manual"):
                 return 0
         cleanup_shell_files()
         sess = snapshot(cfg)
+        try:
+            track_live_client_pids()
+        except Exception as e:
+            log(f"save: process tracker: {e!r}")
+        old_pre = None
+        try:
+            with open(SESSION) as f:
+                old_pre = json.load(f)
+        except (OSError, ValueError):
+            pass
+        if old_pre and cfg.get("preserve_crashed", True):
+            sess, preserved = merge_preserved_items(old_pre, sess, enabled=True)
+            # preserved notes are already in the log
         n = windows_count(sess)
         if n == 0 and not final:
             log(f"save ({reason}): no windows, keeping previous session")
             return 0
-        old = None
-        try:
-            with open(SESSION) as f:
-                old = json.load(f)
-        except (OSError, ValueError):
-            pass
+        old = old_pre
         lose = (would_lose_chrome_session(old, sess) if old and not final
                 else (old and would_collapse_chrome_profiles(old, sess)))
         if lose:
@@ -6102,6 +6515,10 @@ def daemon(args):
     lk.write(str(os.getpid()))
     lk.flush()
     log(f"daemon: started (pid {os.getpid()}, v{VERSION})")
+    try:
+        track_live_client_pids()
+    except Exception as e:
+        log(f"daemon: process tracker: {e!r}")
     guard = start_shutdown_guard()
     if guard:
         atexit.register(guard.stop)
@@ -6157,7 +6574,13 @@ def daemon(args):
                 buf += data
                 *lines, buf = buf.split(b"\n")
                 for ln in lines:
-                    ev = ln.split(b">>", 1)[0].decode(errors="replace")
+                    parts = ln.split(b">>", 1)
+                    ev = parts[0].decode(errors="replace")
+                    if ev == "closewindow" and len(parts) > 1:
+                        try:
+                            note_closed_address(parts[1].decode(errors="replace"))
+                        except Exception as e:
+                            log(f"daemon: closewindow tracker: {e!r}")
                     if ev in MONITOR_EVENTS:
                         # Save under the OLD fingerprint first (best-effort), then
                         # after settle switch to the matching layout for the new one.
@@ -6206,6 +6629,10 @@ def daemon(args):
             pending_at = first_event = None
             next_periodic = now + max(15, cfg["save_interval_seconds"])
             if now < grace_until:
+                try:
+                    track_live_client_pids()
+                except Exception:
+                    pass
                 continue
             try:
                 save(reason=reason)
@@ -6228,6 +6655,19 @@ def status(args):
         pass
     alive = pid and os.path.exists(f"/proc/{pid}") and "omarchy-session" in " ".join(cmdline(pid))
     print(f"daemon: {'running, pid ' + str(pid) if alive else 'not running'}")
+    try:
+        sess_now = load_session(SESSION)
+        kept = [it for it in sess_now.get("items") or [] if it.get("preserved_from") == "crash"]
+        if kept:
+            bits = []
+            for it in kept:
+                who = it.get("class") or "?"
+                if it.get("profile"):
+                    who += f" profile={it['profile']}"
+                bits.append(f"{who} ({len(it.get('windows') or [])})")
+            print("preserved after crash: " + ", ".join(bits))
+    except Exception:
+        pass
     for label, p in (("session", SESSION), ("previous", PREV)):
         if os.path.exists(p):
             st = os.stat(p)

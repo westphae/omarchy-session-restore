@@ -10,8 +10,12 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import resource
 import shutil
+import signal
+import subprocess
 import tempfile
+import time
 import unittest
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -632,6 +636,209 @@ class ChromiumQuitHelpersTests(unittest.TestCase):
         with open(os.path.join(ud, prof, "Preferences"), "w") as f:
             json.dump({"profile": {"exit_type": "SessionEnded"}}, f)
         self.assertEqual(m.chromium_exit_kind(ud, prof), "ended")
+
+
+class CrashPreserveTests(unittest.TestCase):
+    """Windows of a crashed app stay in the session; a clean close does not."""
+
+    def setUp(self):
+        self._deaths = dict(m._DEATHS)
+        self._pidfds = dict(m._PIDFDS)
+        m._DEATHS.clear()
+        m._PIDFDS.clear()
+        m._CLIENT_PIDS.clear()
+        m._CLOSED_ALIVE.clear()
+        m._DEATHS_LOADED = True  # do not read the user's deaths file
+        self._old_journal = m._journal_death
+        self._old_save = m._save_deaths
+        m._journal_death = lambda pid: None
+        m._save_deaths = lambda: None
+
+    def tearDown(self):
+        for fd in m._PIDFDS.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        m._DEATHS.clear()
+        m._PIDFDS.clear()
+        m._CLIENT_PIDS.clear()
+        m._CLOSED_ALIVE.clear()
+        m._DEATHS.update(self._deaths)
+        m._PIDFDS.update(self._pidfds)
+        m._journal_death = self._old_journal
+        m._save_deaths = self._old_save
+
+    def _item(self, kind="app", cls="foot", pid=None, profile="", windows=1, title="t"):
+        wins = []
+        for i in range(windows):
+            w = {"title": title, "workspace": 2, "stable": 1000 + i}
+            if pid:
+                w["pid"] = pid
+            wins.append(w)
+        it = {"kind": kind, "class": cls, "argv": ["/usr/bin/foot"], "windows": wins}
+        if profile:
+            it["profile"] = profile
+            it["kind"] = "browser"
+            it["class"] = "google-chrome"
+            it["argv"] = ["/usr/bin/google-chrome-stable", f"--profile-directory={profile}"]
+        return it
+
+    def test_pidfd_records_sigkill_and_sigsegv_as_crashes_and_zero_exit_as_clean(self):
+        # Don't leave sleep(1) core files on the user's machine.
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        def death(sig=None):
+            p = subprocess.Popen(["sleep", "5"] if sig else ["sleep", "0.05"])
+            m.track_pid(p.pid)
+            if sig:
+                os.kill(p.pid, sig)
+            try:
+                for _ in range(50):
+                    rec = m.harvest_pid(p.pid)
+                    if rec:
+                        return rec
+                    time.sleep(0.04)
+                self.fail("no death record for pid %s" % p.pid)
+            finally:
+                try:
+                    p.wait(timeout=1)
+                except Exception:
+                    p.kill()
+
+        rec = death(signal.SIGKILL)
+        self.assertEqual(rec["kind"], "crash")
+        self.assertIn("SIGKILL", rec["detail"])
+        rec = death(signal.SIGSEGV)
+        self.assertEqual(rec["kind"], "crash")
+        self.assertIn("SIGSEGV", rec["detail"])
+        rec = death(None)
+        self.assertEqual(rec["kind"], "clean")
+        self.assertEqual(rec["detail"], "exited 0")
+        rec = death(signal.SIGTERM)
+        self.assertEqual(rec["kind"], "clean")
+        self.assertIn("SIGTERM", rec["detail"])
+
+    def test_crashed_app_is_merged_back_into_the_snapshot(self):
+        m._DEATHS[10_000_4242] = {"kind": "crash", "detail": "killed SIGKILL", "at": time.time()}
+        old = {"items": [
+            self._item(pid=10_000_4242, title="notes"),
+            self._item(kind="terminal", cls="com.mitchellh.ghostty", pid=7, title="shell"),
+        ]}
+        new = {"items": [
+            self._item(kind="terminal", cls="com.mitchellh.ghostty", pid=7, title="shell"),
+        ]}
+        sess, notes = m.merge_preserved_items(old, new)
+        self.assertEqual(len(sess["items"]), 2)
+        kept = sess["items"][1]
+        self.assertEqual(kept["preserved_from"], "crash")
+        self.assertEqual(kept["windows"][0]["title"], "notes")
+        self.assertTrue(notes)
+
+    def test_clean_exit_and_a_still_running_process_are_not_preserved(self):
+        m._DEATHS[10_000_0011] = {"kind": "clean", "detail": "exited 0", "at": time.time()}
+        old = {"items": [self._item(pid=10_000_0011, title="closed")]}
+        sess, notes = m.merge_preserved_items(old, {"items": []})
+        self.assertEqual(sess["items"], [])
+        self.assertEqual(notes, [])
+
+        p = subprocess.Popen(["sleep", "8"])
+        self.addCleanup(p.kill)
+        old = {"items": [self._item(pid=p.pid, title="still up, window closed")]}
+        sess, notes = m.merge_preserved_items(old, {"items": []})
+        self.assertEqual(sess["items"], [])
+        self.assertEqual(notes, [])
+
+    def test_relaunched_app_uses_live_windows_not_the_crashed_ones(self):
+        m._DEATHS[10_000_0009] = {"kind": "crash", "detail": "dumped SIGSEGV", "at": time.time()}
+        old = {"items": [self._item(kind="browser", profile="Default", pid=10_000_0009, windows=2, title="old")]}
+        new = {"items": [self._item(kind="browser", profile="Default", pid=99, windows=1, title="new")]}
+        sess, notes = m.merge_preserved_items(old, new)
+        self.assertEqual(len(sess["items"]), 1)
+        self.assertEqual(sess["items"][0]["windows"][0]["title"], "new")
+        self.assertEqual(notes, [])
+
+    def test_chrome_crashed_exit_type_is_enough_without_a_pid(self):
+        orig = m.chromium_exit_kind
+        m.chromium_exit_kind = lambda ud, prof: "crashed"
+        orig_ud = m.chromium_user_data
+        m.chromium_user_data = lambda *a, **k: "/tmp/fake-chrome"
+        try:
+            old = {"items": [
+                self._item(kind="browser", profile="Default", pid=None, windows=3, title="mail"),
+                self._item(kind="terminal", cls="com.mitchellh.ghostty", pid=7, title="shell"),
+            ]}
+            new = {"items": [
+                self._item(kind="terminal", cls="com.mitchellh.ghostty", pid=7, title="shell"),
+            ]}
+            sess, notes = m.merge_preserved_items(old, new)
+            self.assertEqual(len(sess["items"]), 2)
+            self.assertEqual(sess["items"][1]["preserved_from"], "crash")
+            self.assertIn("exit_type=Crashed", notes[0])
+        finally:
+            m.chromium_exit_kind = orig
+            m.chromium_user_data = orig_ud
+
+    def test_chrome_clean_exit_type_is_not_preserved(self):
+        orig = m.chromium_exit_kind
+        m.chromium_exit_kind = lambda ud, prof: "ended"
+        orig_ud = m.chromium_user_data
+        m.chromium_user_data = lambda *a, **k: "/tmp/fake-chrome"
+        try:
+            old = {"items": [self._item(kind="browser", profile="Default", windows=2, title="mail")]}
+            sess, notes = m.merge_preserved_items(old, {"items": []})
+            self.assertEqual(sess["items"], [])
+            self.assertEqual(notes, [])
+        finally:
+            m.chromium_exit_kind = orig
+            m.chromium_user_data = orig_ud
+
+    def test_disabled_flag_does_not_merge(self):
+        m._DEATHS[10_000_0003] = {"kind": "crash", "detail": "killed SIGKILL", "at": time.time()}
+        old = {"items": [self._item(pid=10_000_0003)]}
+        sess, notes = m.merge_preserved_items(old, {"items": []}, enabled=False)
+        self.assertEqual(sess["items"], [])
+        self.assertEqual(notes, [])
+
+    def test_sibling_chrome_profile_is_also_kept_when_the_process_dies(self):
+        m._DEATHS[10_000_0050] = {"kind": "crash", "detail": "dumped SIGTRAP", "at": time.time()}
+        old = {"items": [
+            self._item(kind="browser", profile="Default", pid=10_000_0050, windows=2, title="a"),
+            self._item(kind="browser", profile="Profile 1", pid=10_000_0050, windows=1, title="b"),
+        ]}
+        sess, notes = m.merge_preserved_items(old, {"items": []})
+        self.assertEqual(len(sess["items"]), 2)
+        self.assertEqual({it["profile"] for it in sess["items"]}, {"Default", "Profile 1"})
+
+
+    def test_process_dying_before_its_windows_close_is_preserved(self):
+        # A vanished window whose pid is already gone (the parent reaped it)
+        # is a crash, e.g. SIGKILL with no coredump.
+        m._CLIENT_PIDS["0xabc"] = 10_000_0999
+        m.track_live_client_pids(clients=[])
+        rec = m.harvest_pid(10_000_0999)
+        self.assertEqual(rec["kind"], "crash")
+        self.assertIn("before its windows closed", rec["detail"])
+        old = {"items": [self._item(pid=10_000_0999, title="editor")]}
+        sess, notes = m.merge_preserved_items(old, {"items": []})
+        self.assertEqual(len(sess["items"]), 1)
+        self.assertEqual(sess["items"][0]["preserved_from"], "crash")
+
+    def test_window_closed_while_running_is_not_preserved_after_the_process_exits(self):
+        p = subprocess.Popen(["sleep", "8"])
+        self.addCleanup(lambda: (p.kill(), p.wait()))
+        m._CLIENT_PIDS["0xdef"] = p.pid
+        m.track_live_client_pids(clients=[])  # window gone, process still up
+        self.assertIn(p.pid, m._CLOSED_ALIVE)
+        p.terminate()
+        p.wait(timeout=2)
+        m.track_live_client_pids(clients=[])
+        rec = m.harvest_pid(p.pid)
+        self.assertEqual(rec["kind"], "clean")
+        sess, notes = m.merge_preserved_items(
+            {"items": [self._item(pid=p.pid, title="closed")]}, {"items": []})
+        self.assertEqual(sess["items"], [])
+        self.assertEqual(notes, [])
+
 
 
 if __name__ == "__main__":
